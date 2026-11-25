@@ -1,0 +1,15 @@
+# окружение и секреты
+.venv/
+.env
+*.key
+
+# собирается автоматически (build_site.py и mkdocs)
+docs/
+site/
+mkdocs.yml
+
+# мусор
+__pycache__/
+*.pyc
+book/test-*/
+book/*/failed.txt
