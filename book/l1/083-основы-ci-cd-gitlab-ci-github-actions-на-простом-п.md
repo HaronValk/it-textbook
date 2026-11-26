@@ -2,474 +2,547 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-Заявка в Service Desk «Вектора»:
+Заявка в учебном трекере «Вектора»:
 
-> **Пользователь:** ivanov (бухгалтерия, WIN11-CL01)
-> **Что написал:** «Добрый день! В папке `\\FS01\Buh\Reports` файл `backup-report.txt` не меняется с понедельника — внутри всё та же дата. Раньше обновлялся каждое утро, я по нему проверяю, что бэкапы 1С прошли. Посмотрите, пожалуйста, а то страшно.»
-> **Срочность:** средняя
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02.
+> **Что написала:** «Иван из бухгалтерии прислал скрипт, который должен был собрать отчёт по отпускам из CSV. У меня он падает с ошибкой на третьей строке. Можете проверить, что там не так? Срочность: средняя, до конца дня».
 
-Ты приходишь на линию, открываешь заявку и через десять минут выясняешь: скрипт, который делает этот отчёт, лежит в Git-репозитории, а проверка скрипта была настроена в CI — и последний запуск проверки на GitHub горит красным крестиком. То есть ошибку «поймали» автоматически ещё в понедельник, но никто не смотрел на результат, а сломанную версию всё равно скопировали на FS01.
+Заявка выглядит как «помогите с файлом», но за ней стоит ровно та проблема, которую решает CI/CD: **скрипт или конфиг никто не проверил автоматически перед тем, как отдать его другому человеку**. В реальной работе L1 всё чаще сталкивается с CI/CD не потому, что «должен уметь настраивать пайплайны», а потому что:
 
-CI/CD — это про то, чтобы такие вещи ловились до того, как их увидит бухгалтер. L1 редко пишет пайплайны сам, но постоянно сталкивается с их последствиями: «после деплоя отвалилось», «сборка упала», «а почему вчерашняя версия скрипта?». После этой главы ты будешь: понимать, что такое пайплайн, стадия, job и runner; уметь читать лог упавшей сборки и находить конкретный шаг, который сломался; уметь сделать минимальный рабочий пайплайн для своего скрипта на GitHub Actions; знать, чем GitLab CI отличается по синтаксису; и главное — уметь передать в L2/DevOps не «у меня не работает», а «job test упал на шаге с строкой 14, коммит a1b2c3d».
+- разработчики и DevOps присылают ссылки на упавшие сборки и просят «посмотреть, что там»;
+- в тикетах появляются слова «pipeline», «job», «runner», «workflow», «artifact»;
+- нужно уметь отличить «упал наш код» от «упал агент сборки / нет доступа к репозиторию / истёк токен»;
+- на собеседовании L1 всё чаще спрашивают: «что такое CI/CD и зачем это вообще?».
+
+После этой главы ты будешь понимать, что такое непрерывная интеграция и непрерывная доставка, чем отличаются GitLab CI и GitHub Actions, как выглядит минимальный пайплайн, как его запустить на своём стенде (Ubuntu UBU01 + публичный репозиторий на GitHub) и как диагностировать типовые поломки. Настраивать production-пайплайны ты пока не будешь — это уровень DevOps, но ты перестанешь бояться слова «pipeline» и сможешь осмысленно эскалировать такие заявки.
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-**CI (Continuous Integration, непрерывная интеграция)** — практика, при которой каждый коммит автоматически проверяется: синтаксис, тесты, сборка. **CD (Continuous Delivery/Deployment)** — продолжение: проверенный код автоматически доставляется на сервер (в тестовую или боевую среду). Вместе это «конвейер»: код прошёл все станции контроля — поехал дальше, не прошёл — остановился.
+**CI (Continuous Integration, непрерывная интеграция)** — практика, при которой каждый коммит в репозиторий автоматически проверяется: собирается, тестируется, линтуется. Цель — поймать ошибку через минуту после коммита, а не через неделю на проде.
 
-Ключевые понятия:
+**CD (Continuous Delivery / Continuous Deployment)** — продолжение: после успешных проверок артефакт автоматически доставляется на стенд (Delivery — с ручным подтверждением) или сразу в прод (Deployment — без подтверждения).
 
-- **Пайплайн (pipeline)** — весь конвейер проверок, описанный файлом в репозитории.
-- **Стадия (stage)** — этап: `lint` → `test` → `deploy`. Стадии идут по порядку.
-- **Job (джоба)** — конкретная работа внутри стадии («проверить синтаксис», «прогнать скрипт»).
-- **Runner (раннер)** — машина, которая эту джобу реально выполняет. Это либо облачный раннер провайдера (GitHub даёт `ubuntu-latest`, `windows-latest`), либо твой собственный сервер (**self-hosted runner**), зарегистрированный в системе.
-- **Артефакт (artifact)** — файл, который джоба оставила после себя (отчёт, лог, собранный пакет). Его можно скачать из веб-интерфейса.
-- **Секрет (secret)** — пароль/токен, который хранится в настройках репозитория и подставляется в пайплайн как переменная, а не лежит в коде.
-- **Триггер** — событие, запускающее пайплайн: `push`, `pull_request`, расписание, ручной запуск.
+Ключевые понятия, которые тебе встретятся в тикетах:
 
-Как это устроено физически:
+- **Репозиторий** — хранилище кода (GitHub, GitLab). Уже знакомая тебе штука из урока 77.
+- **Pipeline (пайплайн)** — весь процесс проверки/сборки, описанный в файле-конфиге в репозитории.
+- **Stage (стадия)** — этап пайплайна: `build`, `test`, `deploy`. Стадии идут последовательно, задачи внутри стадии — параллельно.
+- **Job (задача)** — конкретная работа: «прогнать линтер», «собрать Docker-образ», «запустить тесты».
+- **Runner / Agent** — машина или контейнер, который реально выполняет job. У GitHub Actions это `runner`, у GitLab CI — `runner`.
+- **Trigger (триггер)** — событие, запускающее пайплайн: `push`, `pull_request`, `merge_request`, `schedule`, ручной запуск.
+- **Artifact (артефакт)** — файл, который job оставляет после себя (собранный бинарник, лог, отчёт).
+- **Workflow (в GitHub Actions)** — синоним пайплайна; файл `.github/workflows/<имя>.yml`.
+- **`.gitlab-ci.yml`** — файл конфига пайплайна в GitLab CI, лежит в корне репозитория.
+
+Схема минимального пайплайна:
 
 ```text
- разработчик              GitHub (github.com)                runner (ubuntu-latest)
- ───────────              ──────────────────                ──────────────────────
- git push ───────────────► событие push в ветку
- (HTTPS 443)              │
-                          ├─ читает .github/workflows/*.yml
-                          ├─ ставит в очередь job "lint"
-                          │                                   ┌──────────────────┐
-                          └──────── выдаёт job ──────────────►│ контейнер Ubuntu  │
-                                                                │ checkout кода     │
-                          ◄───── лог, статус зелёный/красный ──│ запуск шагов      │
-                          ├─ ставит job "test" (needs: lint)   └──────────────────┘
-                          └─ принимает артефакт backup-report.txt
+   Разработчик пушит коммит
+            │
+            ▼
+   ┌──────────────────────┐
+   │  Git-сервер (GitHub/ │  ← читает .github/workflows/*.yml
+   │  GitLab)             │     или .gitlab-ci.yml
+   └──────────┬───────────┘
+              │ ставит задачу в очередь
+              ▼
+   ┌──────────────────────┐
+   │  Runner / Agent      │  ← чистая ВМ или контейнер
+   │  (Ubuntu + Docker)   │
+   └──────────┬───────────┘
+              │ выполняет job по шагам
+              ▼
+   ┌──────────────────────┐
+   │  build → test → deploy│
+   │  (stages)            │
+   └──────────┬───────────┘
+              │
+              ▼
+   Результат: ✅ зелёный / ❌ красный + логи
 ```
 
-Важные технические детали, которые нужны на уровне L1:
+**Порты и протоколы**, которые важно знать для диагностики:
 
-- Всё общение идёт по **HTTPS (порт 443)** на `github.com` и `api.github.com`. Раннер сам **исходящим** соединением забирает задачи — входящие порты ему не нужны. Это важно в закрытых корпоративных сетях: часто «GitHub недоступен» — это блокировка на файрволе/прокси, а не проблема пайплайна.
-- Определение пайплайна — обычный **YAML-файл в репозитории**, у GitHub это `.github/workflows/имя.yml`, у GitLab — `.gitlab-ci.yml` в корне. Раз синтаксис отличается, но идея одна.
-- Пайплайн — это **тоже код**: он версионируется, его видно в истории, изменения проходят через pull request.
-- Плоский факт, который надо помнить: **пайплайн не делает код лучше, он делает ошибку видимой**. Если на красный крестик никто не смотрит, CI бесполезен — ровно наш случай с ivanov.
+- Git по HTTPS — TCP 443; по SSH — TCP 22.
+- GitHub Actions runner регистрируется к `github.com` по HTTPS (443).
+- GitLab CI runner — к своему GitLab-серверу по HTTPS (443) или HTTP (80).
+- Docker Hub / реестр образов — TCP 443.
+
+**Где CI/CD живёт в общей картине.** Git — это «кто и что менял». CI/CD — это «что происходит после того, как изменение попало в репозиторий». Docker (урок 82) — это «в чём запускать сборку одинаково на любой машине». Ansible (урок 81) — это «как доставить результат на серверы». Всё вместе — фундамент DevOps.
+
+**GitLab CI vs GitHub Actions — в чём разница для L1:**
+
+| | GitLab CI | GitHub Actions |
+|---|---|---|
+| Файл конфига | `.gitlab-ci.yml` в корне | `.github/workflows/<имя>.yml` |
+| Где живёт | свой GitLab-сервер или gitlab.com | github.com |
+| Раннеры | self-hosted или shared | self-hosted или GitHub-hosted |
+| Секреты | CI/CD Variables | Repository Secrets |
+| Бесплатный лимит | ограничен минутами на shared | ограничен минутами на hosted |
+
+На стенде «Вектора» **своего GitLab пока нет** (GIT01 появится только в DevOps-треке, DevOps №17). Поэтому в лабораторной мы используем **GitHub Actions** — публичный репозиторий на github.com, как в уроке 77. GitLab CI разберём теоретически: синтаксис очень похож, и на собеседовании спрашивают оба.
 
 ## 3. Аналогия из жизни
 
-Представь заводской конвейер с ОТК (отдел технического контроля). Деталь едет по ленте, на первой станции её проверяют на брак по чертежу (это `lint` — синтаксис), на второй — собирают из неё узел и смотрят, крутится ли (это `test`). Если станок ОТК выдал красную лампу, лента останавливается, и деталь дальше на склад не уезжает. Мастер ОТК — это runner: он не придумывает правила, он выполняет чек-лист, который ему написали инженеры. Чек-лист лежит в папке у начальника цеха (в репозитории), и если в чек-листе забыли пункт «проверить резьбу», бракованная деталь спокойно уедет на склад — ОТК честно проверил всё, что ему сказали.
+Представь конвейер на заводе. В начале — склад деталей (репозиторий). Рабочий кладёт новую деталь на ленту (делает `git push`). Дальше лента сама везёт её через станции: сначала контроль размеров (build), потом проверка на брак (test), потом упаковка и отправка в магазин (deploy). Если на любой станции деталь не прошла — лента останавливается, горит красная лампа, и мастер (разработчик) идёт смотреть, что не так. Никто не отправляет в магазин бракованную деталь, потому что её не пропустила станция контроля.
 
-Аналогия перестаёт работать в одном месте: на заводе брак видно глазами, а в CI «зелёный» статус означает только то, что прошли те проверки, которые ты сам заложил — больше ничего.
+Аналогия перестаёт работать в одном месте: на заводе станции физически одни и те же, а в CI/CD «станция» (runner) — это одноразовая виртуалка или контейнер, который создаётся под каждую задачу с нуля и потом уничтожается. Именно поэтому в пайплайне нельзя «поставить пакет один раз и забыть» — каждый запуск начинается с чистого листа.
 
 ## 4. Практика и команды
 
-**1. Файл пайплайна GitHub Actions** — вот минимальный рабочий вариант для нашего скрипта:
+Все команды ниже выполняются на **UBU01** (Ubuntu Server 24.04, 10.10.10.30, SSH, sudo-пользователь `adm.student`), если не указано иное. Git на UBU01 уже установлен (ставили в уроке 77). Docker — в уроке 82.
+
+### 4.1. Посмотреть, есть ли в репозитории конфиг пайплайна
+
+```bash
+cd ~/vektor-scripts
+ls -la .github/workflows/ 2>/dev/null
+ls -la .gitlab-ci.yml 2>/dev/null
+```
+
+`ls -la` показывает скрытые файлы (те, что начинаются с точки). Если ни одного файла нет — пайплайна в репозитории нет, и «красная сборка» в тикете относится к чужому репозиторию. Смотреть надо именно в корне проекта и в `.github/workflows/`.
+
+### 4.2. Прочитать минимальный workflow GitHub Actions
+
+```bash
+cat .github/workflows/check.yml
+```
+
+Пример содержимого (это то, что мы создадим в лабораторной):
 
 ```yaml
-name: ci
-
+name: check
 on:
   push:
     branches: [ main ]
   pull_request:
-  workflow_dispatch:      # кнопка "Run workflow" в интерфейсе
-
-permissions:
-  contents: read          # принцип минимальных прав для токена пайплайна
-
+    branches: [ main ]
 jobs:
   lint:
-    name: Синтаксис PowerShell
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Проверить синтаксис
-        shell: pwsh
-        run: ./ci/check-syntax.ps1
-
-  test:
-    name: Прогон отчёта
-    needs: lint           # test стартует только после успешного lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Собрать отчёт на тестовых данных
-        shell: pwsh
-        run: ./scripts/Backup-Report.ps1 -Path ./testdata -OutFile ./out/backup-report.txt
-      - name: Выгрузить артефакт
-        uses: actions/upload-artifact@v4
-        with:
-          name: backup-report
-          path: out/backup-report.txt
+      - name: Check bash syntax
+        run: bash -n scripts/report.sh
 ```
 
-Разбор: `on` — триггеры; `jobs` — словарь джоб; `runs-on` — какой раннер; `uses` — готовый сторонний экшен; `run` — команда; `needs` — зависимость между джобами. Мажорные версии экшенов (`@v4`) меняются — актуальную смотри в README экшена на GitHub `[ПРОВЕРИТЬ перед копированием в бой]`.
+Разбор:
+- `name` — имя workflow, отображается во вкладке Actions.
+- `on` — триггеры. `push` и `pull_request` в ветку `main`.
+- `jobs.<id>` — задачи. `runs-on: ubuntu-latest` — тип runner.
+- `steps` — шаги. `uses: actions/checkout@v4` клонирует репозиторий внутрь runner.
+- `run:` — команда shell.
 
-**2. Отправить код и запустить пайплайн:**
+### 4.3. Проверить синтаксис bash-скрипта локально (то же, что делает job)
 
 ```bash
-git add .
-git commit -m "ci: проверка синтаксиса и прогон отчёта"
-git push origin main
+bash -n scripts/report.sh
+echo "exit code: $?"
 ```
 
-Ожидаемо: в терминале `-> main`, а на GitHub во вкладке **Actions** появляется новый запуск со статусом «в процессе» → «зелёный».
+`-n` — «не выполнять, только проверить синтаксис». `$?` — код возврата предыдущей команды: `0` — успех, не `0` — ошибка. Именно по коду возврата CI понимает, «зелёный» job или «красный». Если `bash -n` вернул `0`, а пайплайн красный — проблема не в синтаксисе скрипта, а в самом пайплайне или runner.
 
-**3. Посмотреть последние запуски (GitHub CLI):**
+### 4.4. Посмотреть, что реально запускается в job (dry-run)
 
 ```bash
+bash -x scripts/report.sh 2>&1 | head -40
+```
+
+`-x` — трассировка: печатает каждую команду перед выполнением. `2>&1` — перенаправить stderr в stdout, чтобы видеть и ошибки. `head -40` — первые 40 строк. Это ровно то, что ты увидишь в логах job на GitHub, только там ещё сверху будет обвязка runner.
+
+### 4.5. Проверить, что runner может достучаться до GitHub
+
+```bash
+curl -sS -o /dev/null -w "%{http_code}\n" https://github.com
+curl -sS -o /dev/null -w "%{http_code}\n" https://api.github.com
+```
+
+`-sS` — тихий режим, но показывать ошибки. `-o /dev/null` — выбросить тело ответа. `-w "%{http_code}\n"` — напечатать HTTP-код. Ожидаем `200` или `301`. Если `000` или таймаут — сеть/прокси/файрвол. Это первая проверка при «пайплайн висит в очереди».
+
+### 4.6. Посмотреть статус последних запусков через GitHub CLI
+
+```bash
+gh auth status
 gh run list --limit 5
 ```
 
-```text
-STATUS  TITLE                        WORKFLOW  BRANCH  EVENT  ID          ELAPSED
-✓       ci: проверка синтаксиса...   ci        main    push   7123456789  42s
-X       fix: правка скрипта          ci        main    push   7123450000  31s
-```
-
-Смотрим на первый столбец: `✓` — успех, `X` — провал, `*` — идёт. Колонка `ID` нужна для следующей команды.
-
-**4. Лог только упавших шагов — главная команда при разборе заявки:**
+`gh` — официальный GitHub CLI. `gh auth status` показывает, залогинен ли ты и с каким токеном. `gh run list` — список последних запусков workflow с их статусами. Если `gh` не установлен:
 
 ```bash
-gh run view 7123450000 --log-failed
+sudo apt update
+sudo apt install -y gh
 ```
 
-Выведет только шаг, который упал, и его вывод. Это в разы быстрее, чем листать весь лог в браузере.
+Пакет `gh` есть в стандартных репозиториях Ubuntu 24.04 [ПРОВЕРИТЬ в твоём зеркале]. Если недоступен — используй веб-интерфейс: вкладка **Actions** в репозитории.
 
-**5. Следить за запуском в реальном времени:**
+### 4.7. Посмотреть лог конкретного запуска
 
 ```bash
-gh run watch 7123450000
+gh run view <run-id> --log
 ```
 
-**6. Воспроизвести шаг пайплайна локально (до пуша):**
+`<run-id>` — числовой идентификатор из `gh run list`. `--log` — полный лог всех job. В реальной работе L1 чаще всего просят именно «посмотреть лог» — это безопасное действие, которое не меняет ничего в репозитории.
 
-```powershell
-pwsh -NoProfile -File .\scripts\Backup-Report.ps1 -Path .\testdata -OutFile .\out\backup-report.txt
-```
-
-`-NoProfile` — не грузить профиль пользователя (в CI профиля нет, и поведение не должно отличаться), `-File` — запустить файл. Ожидаемый вывод: `Отчёт записан: ...`. Если локально работает, а в CI нет — почти всегда разница в путях (Windows `\` против Linux `/`) или в отсутствующем файле.
-
-**7. Быстрая проверка синтаксиса PowerShell без запуска (то же, что делает `lint`):**
-
-```powershell
-$t = $null; $e = $null
-[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\scripts\Backup-Report.ps1), [ref]$t, [ref]$e) | Out-Null
-if ($e.Count) { $e | ForEach-Object { "строка {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message } } else { "синтаксис ОК" }
-```
-
-Парсер разбирает файл, но не выполняет его — безопасно и быстро.
-
-**8. Найти коммит, который сломал файл:**
+### 4.8. Перезапустить упавший workflow
 
 ```bash
-git log --oneline -5 -- scripts/Backup-Report.ps1
+gh run rerun <run-id>
 ```
 
-```text
-a1b2c3d fix: ускорил сбор списка файлов
-9f8e7d6 feat: отчёт по папке Buh
-```
+`rerun` — перезапустить все job. `--failed` — только упавшие. Это то, что делает L1 по просьбе разработчика, когда падение было «флаки» (нестабильным, из-за сети или таймаута runner).
 
-`--` отделяет путь; видно только коммиты, трогавшие этот файл.
+### 4.9. Сравнить с GitLab CI (теория)
 
-**9. Откатить сломанный коммит (без переписывания истории):**
-
-```bash
-git revert --no-edit a1b2c3d
-git push origin main
-```
-
-`revert` создаёт новый коммит с обратными изменениями — безопасно для общей ветки, в отличие от `reset`.
-
-**10. Проверить состояние задания на FS01 (Windows):**
-
-```powershell
-Invoke-Command -ComputerName FS01 -ScriptBlock {
-    Get-ScheduledTaskInfo -TaskName 'Vektor-BackupReport' |
-        Select-Object LastRunTime, LastTaskResult
-}
-```
-
-`LastTaskResult = 0` — успех, ненулевое значение — ошибка `[ПРОВЕРИТЬ коды по docs.microsoft.com]`. Если задание не запускалось ни разу, там будет большое шестнадцатеричное значение.
-
-**11. Запустить задание руками и посмотреть результат:**
-
-```powershell
-Invoke-Command -ComputerName FS01 -ScriptBlock { Start-ScheduledTask -TaskName 'Vektor-BackupReport' }
-```
-
-**12. Тот же пайплайн на GitLab CI (для сравнения, `.gitlab-ci.yml`):**
+Если бы у «Вектора» был свой GitLab (появится в DevOps №17), тот же пайплайн выглядел бы так:
 
 ```yaml
-stages: [lint, test]
+stages:
+  - test
 
 lint:
-  stage: lint
-  image: mcr.microsoft.com/powershell:lts-ubuntu-22.04   # тег сверить с mcr.microsoft.com
-  script:
-    - pwsh -NoProfile -File ./ci/check-syntax.ps1
-
-test:
   stage: test
-  image: mcr.microsoft.com/powershell:lts-ubuntu-22.04
+  image: ubuntu:24.04
   script:
-    - pwsh -NoProfile -File ./scripts/Backup-Report.ps1 -Path ./testdata -OutFile ./out/backup-report.txt
-  artifacts:
-    paths: [out/backup-report.txt]
+    - bash -n scripts/report.sh
 ```
 
-Отличия: стадии объявляются явно (`stages`), вместо `runs-on` — Docker-образ (`image`), вместо `uses` — часто просто `script`. Полноценно потрогаем GitLab на стенде GIT01 в треке DevOps — на L1 этой машины ещё нет.
+Ключевые отличия: `stages` вместо `jobs`, `script` вместо `steps`, `image` вместо `runs-on`. Логика та же: стадии, задачи, команды, код возврата.
 
-**13. Linux-сторона, пригодится позже:** self-hosted раннер живёт как служба systemd, статус — `systemctl status 'actions.runner.<owner>-<repo>.<имя>.service'`. Имя юнита зависит от того, как зарегистрирован раннер `[ПРОВЕРИТЬ на конкретной машине]`.
+### 4.10. GUI: где смотреть в браузере
+
+- **GitHub:** репозиторий → вкладка **Actions** → выбрать workflow слева → выбрать запуск → раскрыть job → раскрыть шаг. Красный крестик — job упал, зелёная галочка — прошёл.
+- **GitLab:** репозиторий → **CI/CD** → **Pipelines** → выбрать пайплайн → выбрать job → лог.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **DC01** (10.10.10.10) — AD DS, DNS, DHCP, домен `corp.vektor.lab`, учётка `adm.student`.
-- **FS01** (10.10.10.20) — файловый сервер, есть папки `\\FS01\Obshchee` и `\\FS01\Buh` (права у `GG-Buh`).
-- **WIN11-CL01** — рабочее место, куда ты входишь как `adm.student` (локальный админ домена), установлен **Git for Windows** и есть PowerShell 7 (`pwsh`). Если Git не стоит — ставь с git-scm.com, это бесплатно.
-- Аккаунт на github.com. Публичный репозиторий (`vektor-infra`) — потому что на публичные репозитории облачные раннеры GitHub бесплатны. Для приватных на бесплатном тарифе есть лимит минут в месяц `[ПРОВЕРИТЬ актуальные цифры]`. Доступ к github.com из РФ обычно есть, но бывают ограничения у провайдера — если недоступен, легальная альтернатива: self-hosted GitLab CE на своей ВМ (это уже трек DevOps, машина GIT01).
-
-Локальная папка на FS01 для шар `Buh` — считаем `C:\Shares\Buh`. Если у тебя другая, уточни:
-
-```powershell
-Get-SmbShare -Name Buh | Select-Object Name, Path
-```
-
-Учётные данные для входа на GitHub в примерах не нужны — используется твой личный аккаунт.
+- **UBU01** (10.10.10.30, Ubuntu Server 24.04) работает, доступ по SSH под `adm.student`, sudo настроен.
+- На UBU01 установлены `git` (урок 77), `curl`, `bash`. Docker — по желанию (урок 82), для этой лабораторной не обязателен.
+- У тебя есть **личный аккаунт на github.com** и созданный в уроке 77 публичный репозиторий (например, `vektor-scripts`). Если репозитория нет — создай пустой публичный.
+- На хосте `C:\Lab\vektor` есть папка `docs` и журнал `stand-log.md`.
+- Домена `corp.vektor.lab` на стенде уже есть (с L1 №42), но для этой лабораторной он не нужен — работаем только с UBU01 и внешним GitHub.
 
 ### Снапшот
 
-В VMware Workstation на **WIN11-CL01** и **FS01**: меню `VM` → `Snapshot` → `Take Snapshot…`, имя — `before-l1-083`. DC01 не трогаем, но если хочешь единообразия — тоже сделай.
+В VMware Workstation на хосте:
+
+1. Выключи UBU01 аккуратно: `sudo shutdown -h now`.
+2. В VMware Workstation выбери ВМ **UBU01** → **VM** → **Snapshot** → **Take Snapshot**.
+3. Имя: `before-l1-083`. Описание: «Перед лабораторной 83, CI/CD на GitHub Actions».
+4. Включи UBU01 обратно.
+
+Снапшот только на UBU01 — остальные ВМ в этой лабораторной не меняются.
 
 ### Шаги
 
-1. **WIN11-CL01.** Создай на GitHub пустой репозиторий `vektor-infra` (public, без README). Затем в PowerShell:
-   ```powershell
-   New-Item -ItemType Directory C:\work -Force | Out-Null
-   cd C:\work
-   git clone https://github.com/<твой-логин>/vektor-infra.git
-   cd vektor-infra
-   git config user.name  "adm.student"
-   git config user.email "adm.student@corp.vektor.lab"
-   ```
-   Ожидаемо: `Cloning into 'vektor-infra'...` и пустая папка с `.git`.
+1. **На UBU01, под `adm.student`.** Перейти в папку проекта и убедиться, что репозиторий на месте:
 
-2. **WIN11-CL01.** Создай структуру: `scripts\`, `ci\`, `testdata\`. В `testdata` положи два-три файла-пустышки (`Договор.txt`, `Счёт.txt`) — на них будем прогонять скрипт без доступа к FS01.
-
-3. **WIN11-CL01.** Создай `scripts\Backup-Report.ps1`:
-   ```powershell
-   [CmdletBinding()]
-   param(
-       [string]$Path    = 'C:\Shares\Buh',
-       [string]$OutFile = 'C:\Shares\Buh\Reports\backup-report.txt'
-   )
-   $ErrorActionPreference = 'Stop'
-   if (-not (Test-Path -LiteralPath $Path)) { throw "Папка не найдена: $Path" }
-
-   $files = Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue
-   $lines = @()
-   $lines += "Отчёт по папке: $Path"
-   $lines += "Сформирован: $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-   $lines += "Файлов: $($files.Count)"
-   $lines += ("Объём, МБ: {0:N1}" -f (($files | Measure-Object Length -Sum).Sum / 1MB))
-   $lines += ""
-   $lines += "Последние изменённые файлы:"
-   $lines += $files | Sort-Object LastWriteTime -Descending | Select-Object -First 10 |
-       ForEach-Object { "{0}  {1}" -f $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm'), $_.FullName }
-
-   $dir = Split-Path -Parent $OutFile
-   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-   Set-Content -LiteralPath $OutFile -Value ($lines -join "`r`n") -Encoding UTF8
-   Write-Output "Отчёт записан: $OutFile"
-   ```
-   Проверь локально: `pwsh -NoProfile -File .\scripts\Backup-Report.ps1 -Path .\testdata -OutFile .\out\r.txt` → должно появиться `Отчёт записан: .\out\r.txt`.
-
-4. **WIN11-CL01.** Создай `ci\check-syntax.ps1`:
-   ```powershell
-   $failed = $false
-   Get-ChildItem -Path ./scripts -Filter *.ps1 -Recurse | ForEach-Object {
-       $tokens = $null; $errors = $null
-       [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-       if ($errors.Count -gt 0) {
-           $failed = $true
-           Write-Host "FAIL: $($_.Name)"
-           $errors | ForEach-Object { Write-Host ("  строка {0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
-       } else { Write-Host "OK: $($_.Name)" }
-   }
-   if ($failed) { exit 1 }
-   ```
-   Запусти `pwsh -NoProfile -File .\ci\check-syntax.ps1` → ожидаемо `OK: Backup-Report.ps1`.
-
-5. **WIN11-CL01.** Создай `.github\workflows\ci.yml` ровно как в разделе 4, пункт 1. Закоммить и запушь:
-   ```powershell
-   git add . ; git commit -m "ci: первый пайплайн" ; git push origin main
-   ```
-   Ожидаемо: push без ошибок.
-
-6. **WIN11-CL01, браузер.** Открой репозиторий → вкладка **Actions** → запуск `ci` → оба джоба зелёные. Кликни на `test` → видно пошаговый лог, последний шаг `Выгрузить артефакт` завершён. Внизу страницы запуска — блок **Artifacts** с `backup-report`, скачай и открой: там список файлов из `testdata`.
-
-7. **WIN11-CL01 → FS01.** Разверни скрипт на сервере: создай каталоги и скопируй файл через админ-шару (у `adm.student` права доменного админа):
-   ```powershell
-   Invoke-Command -ComputerName FS01 -ScriptBlock {
-       New-Item -ItemType Directory C:\Scripts -Force | Out-Null
-       New-Item -ItemType Directory C:\Shares\Buh\Reports -Force | Out-Null
-   }
-   Copy-Item .\scripts\Backup-Report.ps1 -Destination \\FS01\C$\Scripts\Backup-Report.ps1 -Force
-   ```
-   Ожидаемо: файл лежит в `C:\Scripts` на FS01.
-
-8. **WIN11-CL01.** Запусти скрипт на FS01 руками:
-   ```powershell
-   Invoke-Command -ComputerName FS01 -ScriptBlock {
-       powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\Backup-Report.ps1
-   }
-   ```
-   Ожидаемо: `Отчёт записан: C:\Shares\Buh\Reports\backup-report.txt`. Открой `\\FS01\Buh\Reports\backup-report.txt` под `ivanov` — файл на месте.
-
-9. **WIN11-CL01.** Создай ежедневное задание по расписанию от имени SYSTEM (у SYSTEM есть доступ к локальным папкам FS01 и не нужен пароль):
-   ```powershell
-   schtasks /create /s FS01 /tn "Vektor-BackupReport" ^
-     /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Scripts\Backup-Report.ps1" ^
-     /sc daily /st 07:30 /ru "SYSTEM" /f
-   Invoke-Command -ComputerName FS01 -ScriptBlock { Start-ScheduledTask -TaskName 'Vektor-BackupReport' }
-   ```
-   Ожидаемо: `Успех: успешно создана задача "Vektor-BackupReport"`. В реальной работе задание от SYSTEM — упрощение: боевые задачи лучше запускать от отдельной сервисной учётки с минимальными правами.
-
-10. **WIN11-CL01.** Отработай сценарий «через pull request»: создай ветку, поменяй мелочь в скрипте, запушь, открой PR.
-    ```powershell
-    git switch -c feature/report-header
-    # добавь в скрипт строку $lines += "Версия отчёта: 2"
-    git commit -am "feat: версия отчёта в шапке" ; git push -u origin feature/report-header
+    ```bash
+    cd ~/vektor-scripts
+    git status
+    git remote -v
     ```
-    Ожидаемо: в PR появился блок проверок, `lint` и `test` зелёные, кнопка **Merge** доступна. Смёржи в `main`.
 
-11. **WIN11-CL01.** Запиши изменения в `stand-log.md`.
+    Ожидаемо: `On branch main`, `nothing to commit, working tree clean`, в `remote -v` — `origin  https://github.com/<твой-логин>/vektor-scripts.git`. Если remote нет — добавь: `git remote add origin https://github.com/<твой-логин>/vektor-scripts.git`.
+
+2. **Создать тестовый скрипт, который будет проверять пайплайн.** В корне репозитория:
+
+    ```bash
+    mkdir -p scripts
+    cat > scripts/report.sh <<'EOF'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "report: start"
+    echo "report: done"
+    EOF
+    chmod +x scripts/report.sh
+    bash -n scripts/report.sh && echo "syntax OK"
+    ```
+
+    Ожидаемо: `syntax OK`. `set -euo pipefail` — «строгий режим» bash: падать на любой ошибке, на необъявленной переменной, на ошибке в конвейере. Это стандарт для скриптов в CI.
+
+3. **Создать workflow GitHub Actions.** В корне репозитория:
+
+    ```bash
+    mkdir -p .github/workflows
+    cat > .github/workflows/check.yml <<'EOF'
+    name: check
+    on:
+      push:
+        branches: [ main ]
+      pull_request:
+        branches: [ main ]
+    jobs:
+      lint:
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Check bash syntax
+            run: bash -n scripts/report.sh
+    EOF
+    ```
+
+    Ожидаемо: файл создан. Проверь: `cat .github/workflows/check.yml`.
+
+4. **Закоммитить и запушить.**
+
+    ```bash
+    git add scripts/report.sh .github/workflows/check.yml
+    git commit -m "ci: add syntax check workflow"
+    git push origin main
+    ```
+
+    Ожидаемо: пуш прошёл, в выводе — ссылка на коммит. Если GitHub просит логин/пароль — используй **personal access token** (Settings → Developer settings → Personal access tokens → Fine-grained tokens), не пароль аккаунта. Пароль от аккаунта GitHub для git-операций по HTTPS не подходит с 2021 года.
+
+5. **Посмотреть запуск через `gh`.**
+
+    ```bash
+    gh auth status
+    gh run list --limit 3
+    ```
+
+    Ожидаемо: `gh auth status` — `Logged in to github.com as <логин>`. `gh run list` — строка со статусом `completed` и `success` (или `in_progress`, если ещё идёт — подожди 30–60 секунд и повтори). Если `gh` не залогинен: `gh auth login` и следуй подсказкам (выбери HTTPS, браузер или токен).
+
+6. **Посмотреть лог успешного job.**
+
+    ```bash
+    gh run view <run-id> --log
+    ```
+
+    `<run-id>` — число из первой колонки `gh run list`. Ожидаемо: в логе видно `Check bash syntax` и `bash -n scripts/report.sh` без ошибок, в конце — `Process completed with exit code 0`. Вывод примерный, точные строки зависят от версии runner.
+
+7. **Сломать скрипт и увидеть красный пайплайн.** Внеси синтаксическую ошибку:
+
+    ```bash
+    echo 'if [ 1 -eq 1 ]; then echo yes' >> scripts/report.sh
+    bash -n scripts/report.sh; echo "exit: $?"
+    ```
+
+    Ожидаемо: `bash -n` вернёт ошибку вида `syntax error: unexpected end of file`, `exit: 2`. Это ровно то, что увидит job.
+
+8. **Закоммитить поломку и запушить.**
+
+    ```bash
+    git add scripts/report.sh
+    git commit -m "test: break syntax on purpose"
+    git push origin main
+    ```
+
+    Ожидаемо: пуш прошёл. Через 30–60 секунд `gh run list` покажет новый запуск со статусом `failure`.
+
+9. **Посмотреть лог упавшего job.**
+
+    ```bash
+    gh run list --limit 1
+    gh run view <новый-run-id> --log
+    ```
+
+    Ожидаемо: в логе шаг `Check bash syntax` завершился с `exit code 2` и текстом `syntax error`. Именно этот лог в реальной работе ты бы приложил к тикету.
+
+10. **Починить и убедиться, что пайплайн снова зелёный.**
+
+    ```bash
+    git revert --no-edit HEAD
+    git push origin main
+    ```
+
+    `git revert` создаёт новый коммит, отменяющий предыдущий — это правильный способ «откатить» изменение в общем репозитории (в отличие от `git reset`, который переписывает историю и ломает её у коллег). Ожидаемо: новый запуск через 30–60 секунд со статусом `success`.
+
+11. **Записать в журнал.** На хосте в `C:\Lab\vektor\stand-log.md` добавь запись:
+
+    ```text
+    ## L1 №83 — CI/CD на GitHub Actions
+    - UBU01: создан ~/vektor-scripts/.github/workflows/check.yml
+    - UBU01: создан ~/vektor-scripts/scripts/report.sh
+    - GitHub: репозиторий vektor-scripts, workflow "check" активен
+    - Снапшот: before-l1-083
+    ```
 
 ### Проверка
 
-- [ ] Репозиторий `vektor-infra` существует, в нём есть `scripts/Backup-Report.ps1`, `ci/check-syntax.ps1`, `.github/workflows/ci.yml`, `testdata/`
-- [ ] Во вкладке Actions минимум три запуска: первый push, PR, merge
-- [ ] Скачанный артефакт `backup-report` содержит список файлов из `testdata`
-- [ ] На FS01 существует `C:\Scripts\Backup-Report.ps1` и `C:\Shares\Buh\Reports\backup-report.txt`
-- [ ] `Get-ScheduledTaskInfo -TaskName 'Vektor-BackupReport'` показывает `LastTaskResult = 0`
-- [ ] Под `ivanov` файл `\\FS01\Buh\Reports\backup-report.txt` открывается, дата внутри — сегодняшняя
-- [ ] В `stand-log.md` появилась запись про пайплайн и задание
+- [ ] На UBU01 в `~/vektor-scripts/.github/workflows/check.yml` лежит валидный YAML.
+- [ ] `bash -n scripts/report.sh` возвращает `0`.
+- [ ] `gh run list` показывает минимум три запуска: `success`, `failure`, `success`.
+- [ ] В логе упавшего запуска видна строка `syntax error`.
+- [ ] В `stand-log.md` есть запись про урок 83.
+- [ ] Снапшот `before-l1-083` существует в VMware Workstation.
 
 ### Сломай и почини
 
 **Заявка:**
 
-> **Пользователь:** ivanov (бухгалтерия, WIN11-CL01)
-> **ВМ:** WIN11-CL01 / FS01
-> **Что написал:** «В `\\FS01\Buh\Reports\backup-report.txt` дата не меняется второй день, внутри всё то же самое. Раньше каждое утро обновлялось. Проверьте, бэкапы вообще идут?»
-> **Срочность:** средняя
+> **Пользователь:** Иван Иванов (бухгалтерия), ВМ WIN11-CL01.
+> **Что написал:** «Нашёл в общем репозитории скрипт `report.sh`, но он не запускается. В пайплайне на GitHub написано `failure`, а я не понимаю, что там. Можете посмотреть? Срочность: низкая, но до конца недели нужно».
+> **Срочность:** низкая.
 
-**Как воспроизвести поломку.** На WIN11-CL01 в `scripts\Backup-Report.ps1` убери закрывающую скобку в строке с `Measure-Object` (например, оставь `(($files | Measure-Object Length -Sum).Sum / 1MB` без `)`), закоммить, запушь:
+**Как воспроизвести поломку** (на UBU01, под `adm.student`):
 
-```powershell
-git commit -am "perf: ускорил подсчёт объёма" ; git push origin main
+```bash
+cd ~/vektor-scripts
+echo 'for i in 1 2 3; do echo $i' >> scripts/report.sh
+git add scripts/report.sh
+git commit -m "test: break loop syntax"
+git push origin main
 ```
 
-Затем, «как в понедельник утром», скопируй эту версию на FS01, не глядя на Actions:
+Через 30–60 секунд пайплайн станет красным — ровно то, что видит Иван.
 
-```powershell
-Copy-Item .\scripts\Backup-Report.ps1 -Destination \\FS01\C$\Scripts\Backup-Report.ps1 -Force
-Invoke-Command -ComputerName FS01 -ScriptBlock { Start-ScheduledTask -TaskName 'Vektor-BackupReport' }
-```
+**Диагностика по шагам:**
 
-**Диагностика по шагам (именно в этом порядке):**
+1. Открыть лог упавшего запуска:
 
-1. Подтверди симптом: открой `\\FS01\Buh\Reports\backup-report.txt` — внутри старая дата. Значит, файл не перезаписывается.
-2. Проверь задание на FS01:
-   ```powershell
-   Invoke-Command -ComputerName FS01 -ScriptBlock {
-       Get-ScheduledTaskInfo -TaskName 'Vektor-BackupReport' | Select-Object LastRunTime, LastTaskResult }
-   ```
-   Ожидаемо: `LastRunTime` свежий, `LastTaskResult` — ненулевой (ошибка). Задание запускается, но падает.
-3. Запусти скрипт руками на FS01 — получишь текст ошибки с номером строки: `Не удалось найти ")" в выражении` или похожее. Это уже точный адрес проблемы.
-4. Проверь, кто и когда это сломал:
-   ```powershell
-   git log --oneline -5 -- scripts/Backup-Report.ps1
-   ```
-5. Открой вкладку Actions для этого коммита — `lint` красный, в логе шага `Проверить синтаксис` строка с тем же номером. Вывод для себя: **CI всё поймал, но никто не посмотрел**, а развёртывание было ручным.
-6. Починка: `git revert --no-edit <sha-сломанного-коммита>`, `git push`. Дождись зелёного запуска.
-7. Разверни исправленную версию на FS01 и запусти задание вручную (команды из шагов 7–9 лабораторной).
-8. Убедись, что `\\FS01\Buh\Reports\backup-report.txt` обновился.
+    ```bash
+    gh run list --limit 1
+    gh run view <run-id> --log
+    ```
+
+    В логе — `syntax error: unexpected end of file` на шаге `Check bash syntax`. Значит, проблема в самом скрипте, а не в runner и не в сети.
+
+2. Воспроизвести локально:
+
+    ```bash
+    bash -n scripts/report.sh; echo "exit: $?"
+    ```
+
+    Тот же `exit: 2` и та же ошибка. Подтверждает: дело в скрипте.
+
+3. Найти проблему глазами:
+
+    ```bash
+    tail -5 scripts/report.sh
+    ```
+
+    Видно незакрытый `for ... do` без `done`.
+
+4. Починить:
+
+    ```bash
+    git revert --no-edit HEAD
+    git push origin main
+    ```
+
+    Через 30–60 секунд пайплайн снова зелёный.
+
+**Решение:** откатить «сломанный» коммит через `git revert`, дождаться зелёного пайплайна, приложить ссылку на успешный запуск.
 
 **Ответ пользователю:**
 
-> Иван, добрый день. Разобрались: отчёт не обновлялся из-за ошибки в скрипте, который его формирует — сам бэкап 1С при этом выполнялся штатно, данные в порядке. Ошибку исправили, отчёт обновлён, дальше будет формироваться каждое утро в 07:30. Если завтра файл снова окажется старым — напишите, посмотрим ещё раз.
+> Иван, добрый день. Посмотрел пайплайн `check` в репозитории `vektor-scripts`. Красный статус был из-за синтаксической ошибки в `scripts/report.sh` — незакрытый цикл `for`. Я откатил проблемный коммит, сейчас пайплайн зелёный, ссылка на успешный запуск: <ссылка>. Скрипт можно забирать. Если снова упадёт — пришлите номер запуска, посмотрю лог.
 
-**Закрытие заявки:** категория «Скрипты и автоматизация», решение — «исправлена синтаксическая ошибка в скрипте отчёта, развёрнута корректная версия», в комментарий — ссылка на коммит-фикс и на упавший запуск пайплайна. Так следующий инженер увидит историю.
+**Закрытие заявки:** категория «Разработка / CI», приоритет низкий, решение — «откат коммита через git revert», ссылка на успешный запуск в комментарии. Время — 15–20 минут.
 
 ### Что изменилось на стенде
 
-- GitHub: новый публичный репозиторий `vektor-infra` с пайплайном `.github/workflows/ci.yml` (джобы `lint`, `test`, артефакт `backup-report`).
-- WIN11-CL01: локальная копия репозитория в `C:\work\vektor-infra`, установлен Git for Windows (если не был).
-- FS01: каталоги `C:\Scripts` (скрипт `Backup-Report.ps1`) и `C:\Shares\Buh\Reports` (файл `backup-report.txt`).
-- FS01: задание планировщика `Vektor-BackupReport`, ежедневно 07:30, от имени SYSTEM.
-- Пользователь `ivanov` теперь фактически зависит от этого задания — учитывай в следующих главах про мониторинг.
+- **UBU01:** создан репозиторий `~/vektor-scripts` (если не было) с файлами `scripts/report.sh` и `.github/workflows/check.yml`; в истории git — минимум 4 коммита (создание, поломка, revert, фикс).
+- **GitHub:** в публичном репозитории `vektor-scripts` активирован workflow `check`; в истории — минимум 3 запуска.
+- **Хост:** в `C:\Lab\vektor\stand-log.md` добавлена запись про урок 83.
+- **Новых ВМ, ролей, учёток и адресов не появилось.** Домен `corp.vektor.lab` и AD не затрагивались.
 
 ### Откат
 
-В VMware Workstation на **WIN11-CL01** и **FS01**: `VM` → `Snapshot` → `Snapshot Manager` → выбери `before-l1-083` → `Go to`. Это уберёт каталоги, задание и локальный клон. Важно: **снапшот не откатывает GitHub** — репозиторий останется. Если нужно убрать и его, удали репозиторий в настройках GitHub (`Settings` → внизу `Delete this repository`) или просто оставь как портфолио.
+1. На UBU01: `sudo shutdown -h now`.
+2. В VMware Workstation: **UBU01** → **VM** → **Snapshot** → **Snapshot Manager** → выбрать `before-l1-083` → **Restore**.
+3. Включить UBU01.
+4. В `stand-log.md` дописать строку: `L1 №83 откатан к before-l1-083, изменения на UBU01 отменены`.
+5. **Важно:** откат снапшота не откатывает изменения на github.com. Если нужно «убрать следы» и там — удали workflow-файл отдельным коммитом (`git rm .github/workflows/check.yml && git commit -m "ci: remove check workflow" && git push`). Удалять сам репозиторий не нужно — он пригодится в уроках 84–86.
 
 ## 6. Ошибки новичков и безопасность
 
-- **Ошибка:** пароль или токен вписан прямо в YAML или в скрипт. → **К чему:** через полгода он в истории Git навсегда, даже если файл удалить; при публичном репозитории — мгновенная утечка. → **Как правильно:** секреты только через **Settings → Secrets and variables → Actions**, в коде — `${{ secrets.ИМЯ }}`.
-- **Ошибка:** «красный CI, ну и ладно, потом посмотрю». → **К чему:** ровно заявка ivanov: ошибка есть, но никто её не видит. → **Как правильно:** уведомления о падении (в GitHub — Settings → Notifications), красный статус блокирует merge через branch protection.
-- **Ошибка:** править YAML «наугад», пока не станет зелёным, не читая лог. → **К чему:** потеря времени, случайное отключение проверки. → **Как правильно:** всегда `gh run view <id> --log-failed` и читать конкретную строку.
-- **Ошибка:** `continue-on-error: true` или `|| true` в шаге, чтобы «не мешало». → **К чему:** проверка формально есть, но никогда не падает — конвейер превращается в декорацию. → **Как правильно:** падение = сигнал, чинить причину.
-- **Ошибка:** использовать экшены вида `uses: someone/cool-action@main`. → **К чему:** чужой код в твоём пайплайне может обновиться в любой момент, в том числе во вред (supply chain). → **Как правильно:** фиксировать мажорную версию (`@v4`), в чувствительных проектах — конкретный коммит-SHA.
-- **Ошибка:** думать, что «зелёный CI = всё работает». → **К чему:** проверяются только те сценарии, что заложены; скрипт может успешно отработать и записать пустой отчёт. → **Как правильно:** добавлять проверки на содержимое (не пусто, есть маркер, exit code).
-- **Ошибка:** публиковать в публичный репозиторий внутренние имена серверов, IP, схемы сети реальной компании. → **К чему:** утечка информации об инфраструктуре, разбор от службы ИБ. → **Как правильно:** наш стенд `10.10.10.x` — вымышленный и учебный, это нормально; боевые конфиги — только в приватный репозиторий во внутреннем контуре.
+1. **Ошибка:** хранить пароли и токены прямо в `.github/workflows/*.yml` или в `.gitlab-ci.yml`.
+   **К чему приводит:** токен утекает в публичный репозиторий, им пользуются посторонние. В 2024–2025 годах это одна из самых частых причин инцидентов.
+   **Как правильно:** секреты — только в **Repository Secrets** (GitHub) или **CI/CD Variables** (GitLab), в конфиге ссылаться на них через `${{ secrets.NAME }}` / `$NAME`. В логах секреты маскируются, но только если они объявлены как секреты.
+
+2. **Ошибка:** запускать пайплайн на `push` в любую ветку.
+   **К чему приводит:** каждый черновой коммит тратит минуты runner'а и засоряет историю.
+   **Как правильно:** ограничить триггеры (`branches: [ main ]`, `pull_request`), для черновиков — отдельные workflow или `paths-ignore`.
+
+3. **Ошибка:** думать, что «красный пайплайн = проблема в коде».
+   **К чему приводит:** L1 полчаса ищет ошибку в скрипте, а на самом деле истёк токен, упал runner или GitHub недоступен.
+   **Как правильно:** сначала посмотреть, **на каком шаге** упал job. Если шаг `Set up job` или `actions/checkout` — проблема инфраструктурная, эскалировать. Если шаг с `run:` — проблема в коде.
+
+4. **Ошибка:** править чужой репозиторий напрямую в `main`.
+   **К чему приводит:** ломается история, коллеги не могут смержить свои ветки, а в проде оказывается непроверенный код.
+   **Как правильно:** изменения — через ветку и pull request (PR) / merge request (MR). Пайплайн на PR — это и есть «проверка перед вливанием».
+
+5. **Ошибка:** использовать `git reset --hard` для отката уже запушенного коммита.
+   **К чему приводит:** история переписана, у коллег расхождение, `git push` требует `--force`, что опасно.
+   **Как правильно:** `git revert` — создаёт новый коммит, отменяющий старый, история остаётся линейной.
+
+6. **Ошибка:** запускать self-hosted runner на той же ВМ, где лежат боевые данные.
+   **К чему приводит:** любой, кто может запушить в репозиторий, получает доступ к файлам на runner'е.
+   **Как правильно:** self-hosted runner — отдельная ВМ или контейнер, без доступа к прод-данным. На стенде «Вектора» это правило тоже действует: не запускай runner на DC01 или FS01.
+
+7. **Ошибка:** игнорировать предупреждения `deprecated` в логах workflow.
+   **К чему приводит:** через несколько месяцев workflow перестаёт работать после обновления runner'а.
+   **Как правильно:** раз в квартал просматривать логи на `deprecated` и обновлять версии actions (`actions/checkout@v4` → актуальная).
 
 ### Безопасность
 
-Три вещи, которые на стенде выглядят безобидно, а в бою — инцидент. Первое: **self-hosted раннер на боевом сервере без изоляции**. Раннер выполняет то, что написано в пайплайне; если в репозиторий может прийти pull request от постороннего и раннер его выполнит — это фактически удалённое выполнение кода на твоём сервере. Раннер ставят в отдельную ВМ/контейнер с минимальными правами. Второе: **секреты в логах** — не делай `echo $TOKEN` для отладки, GitHub маскирует известные секреты, но не всё подряд. Третье: **права токена пайплайна** — `permissions: contents: read` по умолчанию, расширять только под конкретную задачу. И дисциплина паролей: `Lab#2026-vektor` — учебный пароль стенда, в реальной среде так нельзя, а `ExecutionPolicy Bypass` в задании планировщика — допустимый костыль для стенда, но не лучшая практика.
+- **Никогда** не коммить в репозиторий файлы с паролями, ключами SSH, токенами, `.env` с реальными значениями. Даже в приватный — история git хранит всё навсегда.
+- **Никогда** не давай L1-уровню права администратора репозитория. Для просмотра логов и перезапуска достаточно роли `read` + `actions: write` в fine-grained token.
+- **Никогда** не запускай в пайплайне команды, которые ты не понимаешь. `curl ... | bash` в workflow — классический вектор атаки на supply chain.
+- **Помни про 152-ФЗ:** если в репозитории окажутся реальные персональные данные сотрудников (даже в тестовых CSV), это уже инцидент. На стенде «Вектора» используй только вымышленные данные.
+- **Помни про 187-ФЗ (КИИ):** в реальной работе «Вектора» (логистика и платежи) CI/CD-пайплайны могут касаться КИИ-объектов. Любые изменения в них — только через согласование с ИБ.
 
 ## 7. Вопросы на собеседовании
 
-**1. Чем CI отличается от CD?**
+**Вопрос 1. Что такое CI/CD и зачем это нужно?**
 
-Ответ: CI (непрерывная интеграция) — автоматическая проверка каждого изменения: синтаксис, тесты, сборка. CD — следующий шаг: автоматическая доставка проверенной версии в тестовую или боевую среду (Continuous Delivery — доставка по кнопке, Continuous Deployment — сразу автоматически). На практике: CI отвечает на вопрос «код не сломан?», CD — «код уже у пользователей?».
+*Как спросят:* «Объясни своими словами, что такое CI/CD. Зачем компании это вообще?»
 
-*Что хочет услышать интервьюер:* что ты различаешь проверку и доставку, а не считаешь это одним словом.
-*Красный флаг:* «это одно и то же, просто сокращения».
+*Ответ:* CI — непрерывная интеграция: каждый коммит автоматически собирается и проверяется, чтобы ошибки ловились сразу, а не через неделю. CD — непрерывная доставка: после успешных проверок артефакт автоматически доставляется на стенд или в прод. Это снижает риск «сломанного прода» и ускоряет выпуск изменений. На стенде я делал минимальный workflow на GitHub Actions, который проверял синтаксис bash-скрипта через `bash -n` и падал при ошибке.
 
-**2. Что такое runner и где он может находиться?**
+*Что хочет услышать интервьюер:* понимание разницы между CI и CD, что это про автоматизацию проверок, а не «модный инструмент».
 
-Ответ: Runner — машина (или контейнер), которая выполняет джобы пайплайна. Бывает облачный, предоставленный провайдером (у GitHub — `ubuntu-latest`, `windows-latest`), и self-hosted — своя ВМ, зарегистрированная в системе. Self-hosted нужен, когда раннеру надо попасть во внутреннюю сеть, когда нужны специфичные инструменты или когда облако недоступно/не подходит по требованиям ИБ — у нас в стране это частая причина ставить GitLab CE с раннером внутри контура. Раннер всегда сам забирает задачи исходящим HTTPS, входящие порты открывать не нужно.
+*Красный флаг:* «CI/CD — это когда Docker» или «это когда Jenkins».
 
-*Что хочет услышать интервьюер:* понимание, что «магия» где-то исполняется и это управляемая машина.
-*Красный флаг:* «раннер — это сервер GitHub, туда нельзя ничего установить» (можно, на self-hosted).
+**Вопрос 2. Чем отличаются GitLab CI и GitHub Actions?**
 
-**3. Пайплайн на основной ветке упал. Твои действия как L1?**
+*Как спросят:* «С какими CI-системами работал? В чём разница?»
 
-Ответ: сначала открыть запуск и посмотреть, какой именно джоб и шаг упал (`gh run view <id> --log-failed`), выписать текст ошибки и номер строки. Проверить, что упало: наша проверка (тогда это ошибка в нашем коде) или инфраструктура (нет связи с внешним ресурсом, истёк токен). Воспроизвести шаг локально. Если ошибка в коде — откатить проблемный коммит через `git revert` или передать автору изменения. Если не хватает прав или причина неясна — эскалировать в L2/DevOps, приложив ссылку на упавший запуск, ID, имя шага и текст ошибки. Перезапускать «на всякий случай» без причины — плохая практика.
+*Ответ:* Оба — CI/CD-платформы, встроенные в Git-хостинг. В GitLab CI конфиг лежит в `.gitlab-ci.yml` в корне, ключевые секции — `stages`, `jobs`, `script`. В GitHub Actions — файлы в `.github/workflows/*.yml`, ключевые секции — `on`, `jobs`, `steps`, `runs-on`. Логика одинаковая: триггер → job на runner'е → шаги → код возврата. GitLab CI чаще выбирают в компаниях с self-hosted GitLab (в РФ это популярно из-за импортозамещения), GitHub Actions — в open-source и стартапах. На стенде я работал с GitHub Actions, GitLab CI знаю теоретически.
 
-*Что хочет услышать интервьюер:* порядок действий и умение передать проблему с фактами.
-*Красный флаг:* «перезапущу несколько раз, может пройдёт».
+*Что хочет услышать интервьюер:* что ты не путаешь файлы конфигов и понимаешь, что концепция одна.
 
-**4. Как хранить пароли для пайплайна?**
+*Красный флаг:* «GitLab CI — это для Linux, GitHub Actions — для Windows».
 
-Ответ: в секретах системы CI (GitHub Actions Secrets, GitLab CI/CD Variables), а не в файлах репозитория. В конфиге ссылаться на переменную. Секреты не печатать в лог, доступ к ним ограничивать, ротировать при утечке или смене людей. Помнить, что в форках публичных репозиториев секреты обычно недоступны — это сделано специально.
+**Вопрос 3. Пайплайн упал. Твои действия?**
 
-*Что хочет услышать интервьюер:* что ты не положишь пароль в YAML.
-*Красный флаг:* «зашифрую пароль в коде base64».
+*Как спросят:* «Разработчик пишет: сборка красная. Что делаешь?»
 
-**5. Что такое артефакт в пайплайне и зачем он нужен?**
+*Ответ:* Сначала смотрю, **на каком шаге** упал job. Если `Set up job`, `actions/checkout` или `setup-*` — проблема инфраструктурная (runner, сеть, токен), эскалирую DevOps. Если шаг с `run:` — смотрю лог, воспроизвожу локально (`bash -n`, `bash -x`, `docker build`), нахожу причину. Если это «флаки» (сеть, таймаут) — перезапускаю (`gh run rerun`). Если ошибка в коде — возвращаю разработчику с логом и ссылкой на запуск. В тикет прикладываю номер запуска и цитату из лога.
 
-Ответ: файл или набор файлов, который джоба сохраняет как результат — отчёт, лог, собранный пакет. Артефакт можно скачать из интерфейса, передать между джобами, приложить к релизу. У нас в лабораторной это `backup-report.txt`: его удобно сравнить с тем, что реально сформировалось на FS01.
+*Что хочет услышать интервьюер:* что ты не бросаешься «чинить код», а сначала локализуешь проблему.
 
-*Что хочет услышать интервьюер:* что ты понимаешь разницу между логом выполнения и результатом работы.
+*Красный флаг:* «Сразу перезапускаю, пока не станет зелёным».
+
+**Вопрос 4. Где хранить секреты в CI/CD?**
+
+*Как спросят:* «Как передать пароль в пайплайн, чтобы он не утёк?»
+
+*Ответ:* В GitHub — Repository Secrets (Settings → Secrets and variables → Actions), в GitLab — CI/CD Variables с флагом `Masked` и `Protected`. В конфиге ссылаться через `${{ secrets.NAME }}` / `$NAME`. В логах значения маскируются. Никогда не коммитить секреты в файлы, даже в приватный репозиторий — история git хранит всё. Для доступа к репозиторию из скриптов — fine-grained token с минимальными правами.
+
+*Что хочет услышать интервьюер:* что ты понимаешь риск утечки и знаешь штатный механизм.
+
+*Красный флаг:* «Положу в `.env` и закоммичу, потом удалю».
+
+**Вопрос 5. Что такое runner и зачем он нужен?**
+
+*Как спросят:* «Кто реально выполняет job в пайплайне?»
+
+*Ответ:* Runner (в GitLab) или runner/agent (в GitHub Actions) — это машина или контейнер, который забирает задачу из очереди и выполняет шаги. Бывает hosted (предоставляется платформой, `ubuntu-latest` в GitHub) и self-hosted (своя ВМ, регистрируется к платформе). Self-hosted нужен, когда hosted не подходит: приватная сеть, специфичное железо, лимиты минут. Важно: runner — одноразовая среда, каждый запуск начинается с чистого листа, поэтому «поставить пакет один раз» не получится.
+
+*Что хочет услышать интервьюер:* понимание, что runner — это отдельная сущность, а не «магия GitHub».
+
+*Красный флаг:* «Runner — это сервер, где лежит код».
 
 ## 8. Источники (официальная документация)
 
-- **docs.github.com** — раздел «GitHub Actions»: статьи *Quickstart for GitHub Actions*, *Workflow syntax for GitHub Actions*, *Storing information in secrets*, *About self-hosted runners*. Поиск: `github actions workflow syntax`.
-- **docs.github.com** — *GitHub CLI manual* (команды `gh run`, `gh workflow`). Поиск: `gh run view log-failed`.
-- **docs.gitlab.com** — раздел «CI/CD»: *Get started with GitLab CI/CD*, *CI/CD YAML syntax reference*, *GitLab Runner*. Поиск: `gitlab ci yaml reference`.
-- **learn.microsoft.com** — *about_ScheduledTasks* / *Scheduled Tasks* и статьи про `Get-ScheduledTaskInfo`; там же `about_Language_Keywords`, если захочешь глубже разобрать парсер PowerShell. Поиск: `get-scheduledtaskinfo powershell`.
-- **mcr.microsoft.com** — каталог контейнеров Microsoft, образы PowerShell (сверить актуальный тег перед использованием в `.gitlab-ci.yml`). Поиск: `powershell container image mcr`.
-- **git-scm.com** — *Git Reference*, команды `git revert`, `git log`. Поиск: `git revert documentation`.
-
-Всё, что касается точных версий экшенов (`@v4`) и лимитов бесплатных минут — помечено `[ПРОВЕРИТЬ]` намеренно: провайдеры меняют это несколько раз в год, проверяй перед копированием в рабочий проект.
+- **GitHub Docs** (docs.github.com). Раздел **Actions** → **Quickstart** и **Workflow syntax for GitHub Actions**. Поиск: `github actions workflow syntax`.
+- **GitHub Docs** (docs.github.com). Раздел **Actions** → **Security** → **Using secrets in GitHub Actions**. Поиск: `github actions secrets`.
+- **GitHub CLI Manual** (cli.github.com/manual). Разделы `gh run list`, `gh run view`, `gh run rerun`. Поиск: `gh run view log`.
+- **GitLab Docs** (docs.gitlab.com). Раздел **CI/CD** → **Pipelines** → **CI/CD YAML syntax reference**. Поиск: `gitlab ci yaml reference`.
+- **GitLab Docs** (docs.gitlab.com). Раздел **CI/CD** → **Variables**. Поиск: `gitlab ci variables masked protected`.
+- **Git SCM** (git-scm.com). Раздел **Git Basics** → **Undoing Things** (про `git revert`). Поиск: `git revert documentation`.
+- **Docker Docs** (docs.docker.com). Раздел **Build** → **Build overview** — пригодится в следующем уроке про облака и в DevOps-треке. Поиск: `docker build overview`.

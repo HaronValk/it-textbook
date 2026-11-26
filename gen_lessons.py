@@ -35,16 +35,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 BASE_URL = "https://api.deepseek.com"
-DEFAULT_MODEL = "deepseek-flash"    # мощнее и дороже: deepseek-v4-pro (через --model)
+DEFAULT_MODEL = "deepseek-flash"  # мощнее и дороже: deepseek-v4-pro (через --model)
 RETRIES = 4
-DEFAULT_MAX_TOKENS = 32000     # просим с большим запасом; если API не даёт столько, лимит подберётся сам
-MAX_CONTINUATIONS = 5          # сколько раз «доберём» главу, если ответ обрезался по лимиту
+DEFAULT_MAX_TOKENS = (
+    32000  # просим с большим запасом; если API не даёт столько, лимит подберётся сам
+)
+MAX_CONTINUATIONS = 5  # сколько раз «доберём» главу, если ответ обрезался по лимиту
 CONTINUE_PROMPT = (
     "Продолжи главу ровно с того места, где остановился. Не повторяй уже написанное, "
     "не добавляй вступлений и пояснений, не начинай заново. Сохрани структуру и дойди "
     "до конца раздела 8."
 )
-_LEARNED_CAPS = {}             # модель -> максимум токенов, который реально разрешил API
+_LEARNED_CAPS = {}  # модель -> максимум токенов, который реально разрешил API
 _caps_lock = threading.Lock()
 HERE = Path(__file__).resolve().parent
 
@@ -91,20 +93,34 @@ USER_TEMPLATE = """Трек: {track}
 Номер урока: {n}
 Тема урока: {title}
 Имя снапшота для лабораторной: before-{level}-{n:03d}
+Предыдущие треки: {prereq}
 
-Другие уроки этого модуля (не дублируй их содержание, можешь ссылаться на них):
-{siblings}
-
-Предыдущие уроки трека (читатель их уже прошёл, опирайся на них):
+ПРОЙДЕНО в этом треке (опирайся только на это):
 {previous}
 
-Напиши главу по теме «{title}» строго по структуре из системного промпта."""
+НЕ ПРОЙДЕНО (будущие уроки этого трека; не используй их содержимое и созданные в них ВМ, роли и сервисы как готовые):
+{future}
+
+Состояние стенда перед этим уроком вычисли по «Хронологии стенда» из системного промпта.
+
+Напиши главу по теме «{title}» строго по структуре из системного промпта.
+ВНИМАНИЕ: Используй ТОЛЬКО то, что есть в списке «ПРОЙДЕНО». Не используй ВМ, роли и домен из «НЕ ПРОЙДЕНО». Если нужна машина из будущего — используй ту, что уже есть, или оставь теорией. Это строгое правило."""
+
+
+PREREQ = {
+    "l1": "нет (трек для новичка)",
+    "l2": "пройден весь трек L1",
+    "sysadmin": "пройдены треки L1 и L2",
+    "devops": "пройдены треки L1, L2 и сисадмин (Linux-часть гарантирована)",
+}
 
 
 def build_system_prompt(level: str, prompt_path: Path, stand_path: Path) -> str:
     for p in (prompt_path, stand_path):
         if not p.exists():
-            sys.exit(f"Не найден файл {p}. Положи master_prompt.md и stand.md рядом со скриптом.")
+            sys.exit(
+                f"Не найден файл {p}. Положи master_prompt.md и stand.md рядом со скриптом."
+            )
     text = prompt_path.read_text(encoding="utf-8")
     text = text.replace("<<LEVEL>>", LEVELS[level]).replace(
         "<<STAND>>", stand_path.read_text(encoding="utf-8").strip()
@@ -121,7 +137,9 @@ def parse_lessons(path: Path):
             continue
         m = re.match(r"^(\d+)\.\s+(.+)$", line)
         if m:
-            lessons.append({"n": int(m.group(1)), "title": m.group(2).strip(), "module": module})
+            lessons.append(
+                {"n": int(m.group(1)), "title": m.group(2).strip(), "module": module}
+            )
     return lessons
 
 
@@ -154,20 +172,35 @@ def clean(text: str) -> str:
 
 
 def missing_sections(text: str):
-    return [i for i in range(1, 9) if not re.search(rf"^##\s*{i}\.", text, re.MULTILINE)]
+    return [
+        i for i in range(1, 9) if not re.search(rf"^##\s*{i}\.", text, re.MULTILINE)
+    ]
+
+
+def short_title(t):
+    return t.split(":")[0].strip()
 
 
 def build_user_prompt(track, level, lesson, all_lessons):
-    siblings = "\n".join(
-        f"- {x['n']}. {x['title']}"
+    prev = "\n".join(
+        f"- {x['n']}. {short_title(x['title'])}"
         for x in all_lessons
-        if x["module"] == lesson["module"] and x["n"] != lesson["n"]
-    ) or "- (нет)"
-    prev = [x for x in all_lessons if x["n"] < lesson["n"]][-8:]
-    previous = "\n".join(f"- {x['n']}. {x['title']}" for x in prev) or "- (это первый урок трека)"
+        if x["n"] < lesson["n"]
+    )
+    fut = "\n".join(
+        f"- {x['n']}. {short_title(x['title'])}"
+        for x in all_lessons
+        if x["n"] > lesson["n"]
+    )
     return USER_TEMPLATE.format(
-        track=track, level=level, module=lesson["module"], n=lesson["n"],
-        title=lesson["title"], siblings=siblings, previous=previous,
+        track=track,
+        level=level,
+        module=lesson["module"],
+        n=lesson["n"],
+        title=lesson["title"],
+        prereq=PREREQ[level],
+        previous=prev or "- (это первый урок трека)",
+        future=fut or "- (это последний урок)",
     )
 
 
@@ -193,13 +226,18 @@ def request_with_cap(client, model, messages, requested, thinking):
                 if new_cap < cap:
                     with _caps_lock:
                         _LEARNED_CAPS[model] = new_cap
-                    print(f"  лимит ответа для {model}: {new_cap} токенов; длинные главы буду добирать продолжениями", flush=True)
+                    print(
+                        f"  лимит ответа для {model}: {new_cap} токенов; длинные главы буду добирать продолжениями",
+                        flush=True,
+                    )
                     continue
             raise
     raise RuntimeError("не удалось подобрать допустимый max_tokens")
 
 
-def generate(client, model, system_prompt, user_prompt, lesson, max_tokens=None, thinking="high"):
+def generate(
+    client, model, system_prompt, user_prompt, lesson, max_tokens=None, thinking="high"
+):
     for attempt in range(1, RETRIES + 1):
         try:
             messages = [
@@ -216,7 +254,10 @@ def generate(client, model, system_prompt, user_prompt, lesson, max_tokens=None,
                 parts.append(chunk)
                 if choice.finish_reason != "length" or part_no == MAX_CONTINUATIONS:
                     break
-                print(f"  [{lesson['n']}] ответ упёрся в лимит, продолжаю ({part_no + 1}/{MAX_CONTINUATIONS})", flush=True)
+                print(
+                    f"  [{lesson['n']}] ответ упёрся в лимит, продолжаю ({part_no + 1}/{MAX_CONTINUATIONS})",
+                    flush=True,
+                )
                 messages.append({"role": "assistant", "content": chunk})
                 messages.append({"role": "user", "content": CONTINUE_PROMPT})
             text = clean("".join(parts))
@@ -225,30 +266,67 @@ def generate(client, model, system_prompt, user_prompt, lesson, max_tokens=None,
                 raise ValueError(f"нет разделов {miss}")
             return text
         except Exception as e:  # сеть, лимиты, неполный ответ
-            wait = 3 * 2 ** attempt
-            print(f"  [{lesson['n']}] попытка {attempt}/{RETRIES} не удалась: {e}. Жду {wait} c", flush=True)
+            wait = 3 * 2**attempt
+            print(
+                f"  [{lesson['n']}] попытка {attempt}/{RETRIES} не удалась: {e}. Жду {wait} c",
+                flush=True,
+            )
             time.sleep(wait)
     return None
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Генератор уроков по списку названий (DeepSeek API)")
+    ap = argparse.ArgumentParser(
+        description="Генератор уроков по списку названий (DeepSeek API)"
+    )
     ap.add_argument("lessons_file", nargs="?", help="txt-файл со списком уроков")
     ap.add_argument("--level", choices=sorted(LEVELS), help="Уровень/трек")
-    ap.add_argument("--track", default=None, help="Название трека для оглавления (по умолчанию из --level)")
-    ap.add_argument("--out", default=None, help="Папка для глав (по умолчанию book/<level>)")
-    ap.add_argument("--only", default="", help="Только эти номера, например 1-3 или 5,7,10-12")
-    ap.add_argument("--workers", type=int, default=3, help="Параллельных запросов (по умолчанию 3)")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="Модель: deepseek-flash (по умолчанию) или deepseek-v4-pro")
-    ap.add_argument("--thinking", choices=["off", "low", "high", "max"], default="high",
-                    help="Режим рассуждения: off — выключен (быстрее и дешевле), low/high/max — глубина (по умолчанию high, как у API)")
+    ap.add_argument(
+        "--track",
+        default=None,
+        help="Название трека для оглавления (по умолчанию из --level)",
+    )
+    ap.add_argument(
+        "--out", default=None, help="Папка для глав (по умолчанию book/<level>)"
+    )
+    ap.add_argument(
+        "--only", default="", help="Только эти номера, например 1-3 или 5,7,10-12"
+    )
+    ap.add_argument(
+        "--workers", type=int, default=3, help="Параллельных запросов (по умолчанию 3)"
+    )
+    ap.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Модель: deepseek-flash (по умолчанию) или deepseek-v4-pro",
+    )
+    ap.add_argument(
+        "--thinking",
+        choices=["off", "low", "high", "max"],
+        default="high",
+        help="Режим рассуждения: off — выключен (быстрее и дешевле), low/high/max — глубина (по умолчанию high, как у API)",
+    )
     ap.add_argument("--prompt", default=str(HERE / "master_prompt.md"))
     ap.add_argument("--stand", default=str(HERE / "stand.md"))
-    ap.add_argument("--max-tokens", type=int, default=None,
-                    help="Лимит одного ответа в токенах (по умолчанию 32000; если API не даёт столько, скрипт сам подберёт максимум)")
-    ap.add_argument("--list-models", action="store_true", help="Показать модели, доступные твоему ключу, и выйти")
-    ap.add_argument("--force", action="store_true", help="Перегенерировать, даже если файл уже есть")
-    ap.add_argument("--dry-run", action="store_true", help="Показать итоговый промпт первого урока и выйти")
+    ap.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Лимит одного ответа в токенах (по умолчанию 32000; если API не даёт столько, скрипт сам подберёт максимум)",
+    )
+    ap.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Показать модели, доступные твоему ключу, и выйти",
+    )
+    ap.add_argument(
+        "--force", action="store_true", help="Перегенерировать, даже если файл уже есть"
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Показать итоговый промпт первого урока и выйти",
+    )
     args = ap.parse_args()
 
     if args.list_models:
@@ -256,6 +334,7 @@ def main():
         if not key:
             sys.exit("Не задана переменная окружения DEEPSEEK_API_KEY")
         from openai import OpenAI
+
         for m in OpenAI(api_key=key, base_url=BASE_URL).models.list().data:
             print(m.id)
         return
@@ -273,33 +352,53 @@ def main():
 
     only = parse_only(args.only) if args.only else None
     todo = [
-        l for l in lessons
+        l
+        for l in lessons
         if (not only or l["n"] in only)
         and (args.force or not (out_dir / file_name(l)).exists())
     ]
 
     if args.dry_run:
         if not todo:
-            sys.exit("Нечего генерировать (все выбранные уроки уже есть). Добавь --force.")
+            sys.exit(
+                "Нечего генерировать (все выбранные уроки уже есть). Добавь --force."
+            )
         print("=== SYSTEM ===\n" + system_prompt)
-        print("\n=== USER ===\n" + build_user_prompt(track, args.level, todo[0], lessons))
+        print(
+            "\n=== USER ===\n" + build_user_prompt(track, args.level, todo[0], lessons)
+        )
         return
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         sys.exit("Не задана переменная окружения DEEPSEEK_API_KEY")
 
-    from openai import OpenAI  # импорт здесь, чтобы --dry-run работал без установленного пакета
+    from openai import (
+        OpenAI,
+    )  # импорт здесь, чтобы --dry-run работал без установленного пакета
+
     client = OpenAI(api_key=api_key, base_url=BASE_URL, timeout=900)
 
     by_num = {l["n"]: build_user_prompt(track, args.level, l, lessons) for l in todo}
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Всего в списке: {len(lessons)}. К генерации: {len(todo)}. Папка: {out_dir}", flush=True)
+    print(
+        f"Всего в списке: {len(lessons)}. К генерации: {len(todo)}. Папка: {out_dir}",
+        flush=True,
+    )
 
     failed = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {
-            pool.submit(generate, client, args.model, system_prompt, by_num[l["n"]], l, args.max_tokens, args.thinking): l
+            pool.submit(
+                generate,
+                client,
+                args.model,
+                system_prompt,
+                by_num[l["n"]],
+                l,
+                args.max_tokens,
+                args.thinking,
+            ): l
             for l in todo
         }
         for fut in as_completed(futures):
@@ -332,7 +431,9 @@ def main():
         (out_dir / "failed.txt").write_text(
             "\n".join(f"{l['n']}. {l['title']}" for l in failed), encoding="utf-8"
         )
-        print(f"\nНе удалось: {len(failed)} (список в failed.txt). Запусти команду ещё раз: готовые пропустятся.")
+        print(
+            f"\nНе удалось: {len(failed)} (список в failed.txt). Запусти команду ещё раз: готовые пропустятся."
+        )
     else:
         print("\nГотово.")
 

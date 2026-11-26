@@ -2,417 +2,489 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-**Заявка № 4127.** Пользователь: `ivanov` (бухгалтерия). ВМ: WIN11-CL01. Что написал: «Иван, привет. Нам в отдел пришёл новый сотрудник, нужно поставить ему на компьютер 7-Zip, Adobe Reader и прогу для сканера, и на FS01 создать папку. И ещё у Петровой обновить драйвер принтера. Сколько это займёт?» Срочность: Средняя.
+Заявка в учебной очереди `C:\Support\Tickets`:
 
-Вы уже умеете ползать по каждой машине руками и писать скрипты на PowerShell (урок 78) и Bash (урок 79). Но когда «поставить 7-Zip» надо на пяти машинах, а «создать папку» — на файловом сервере, вы каждый раз идёте в RDP и делаете одно и то же. Ansible решает ровно это: вы описываете **желаемое состояние** один раз в текстовом файле, а инструмент сам обходит машины и приводит их к этому состоянию.
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02
+> **Что написал:** «Иван из бухгалтерии говорит, что у него на WIN11-CL01 пропала папка с ярлыками на рабочем столе, а у меня на WIN10-CL02 не открывается общая папка `\\FS01\HR`. И ещё: у нас же в компании 50 человек, вы что, каждому вручную одно и то же настраиваете?»
+> **Срочность:** средняя
 
-В этой главе вы поставите Ansible на UBU01, научите его ходить на Linux-машины по SSH и на Windows-серверы по WinRM, соберёте первый плейбук и поймёте, что такое идемпотентность. Для L1 это не «обязанность», а сильный плюс на собеседовании и прямой мост к DevOps. После главы вы должны уметь: поднять control node, написать inventory, прогнать ad-hoc команду, запустить плейбук в режиме проверки и объяснить, почему он упал.
+Последний вопрос Марии — самый важный. Когда машин две, можно бегать руками. Когда их пятьдесят, а типовых действий десяток (создать пользователя, положить ярлык, проверить службу, обновить пакет), руками ты утонешь и обязательно где-то ошибёшься. Именно для этого придумали **Ansible** — инструмент, который описывает «как должно быть» в текстовом файле и сам приводит машины к этому состоянию.
+
+После этой главы ты будешь уметь: поставить Ansible на UBU01, настроить инвентарь (список машин), проверить связь с Linux по SSH и с Windows по WinRM, написать первый плейбук, который создаёт файл на Linux и на Windows, и запускать его повторно, видя, что «ничего не изменилось» — это и есть идемпотентность, главная идея Ansible. Это прямой мост к DevOps: там без Ansible (или его аналогов) не обходится почти ни один проект.
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-Ansible — **агентless**-система управления конфигурациями. На управляемых машинах ничего не устанавливается: Ansible подключается по уже существующему каналу, кладёт туда маленькую программу-модуль (временный файл), выполняет её, забирает JSON-результат и удаляет файл.
+Ansible — **агентless** (без агента). На управляемых машинах ничего ставить не надо. Управляющая машина (у нас UBU01) подключается к целевой по уже существующему каналу:
+
+- **Linux** — по **SSH** (порт 22), под учёткой `adm.student`, с sudo для привилегированных действий.
+- **Windows** — по **WinRM** (Windows Remote Management, порт 5985 для HTTP или 5986 для HTTPS), под доменной или локальной учёткой с правами администратора.
+
+Схема:
+
+```text
+                +-------------------+
+                |   UBU01 (control) |
+                |   ansible-core    |
+                |   inventory.ini   |
+                |   playbook.yml    |
+                +---------+---------+
+                          |
+        +-----------------+------------------+
+        |                                    |
+   SSH :22                             WinRM :5985
+        |                                    |
+  +-----v------+   +-----------+      +------v------+   +-----------+
+  |  DC01      |   |  FS01     |      | WIN11-CL01  |   | WIN10-CL02|
+  | (Linux?   |   | (Linux?   |      |  Windows 11 |   | Windows 10|
+  |  нет, Win) |   |  нет, Win)|      |  ivanov     |   |  petrova  |
+  +------------+   +-----------+      +-------------+   +-----------+
+        \             /
+         \___________/
+              |
+         тоже WinRM :5985
+```
 
 Ключевые понятия:
 
-- **Control node** — машина, где установлен Ansible. У нас это `UBU01` (10.10.10.30). На Windows control node не поддерживается — только Linux/macOS/WSL.
-- **Managed node (хост)** — машина, которой управляют: `ASTRA01` (10.10.10.31), `DC01` (10.10.10.10), `FS01` (10.10.10.20).
-- **Inventory** — список хостов и их параметров подключения (файл `inventory.ini`).
-- **Модуль** — «типовая работа»: `copy`, `file`, `apt`, `win_service`, `win_copy`. Модули идемпотентны: они сначала смотрят текущее состояние и меняют что-то только если нужно.
-- **Задача (task)** — вызов модуля с параметрами.
-- **Плейбук (playbook)** — YAML-файл со списком «пьес» (play), каждая пьеса — набор задач для группы хостов.
-- **Идемпотентность** — повторный запуск ничего не меняет. Первый прогон: `changed=3`. Второй: `changed=0`. Это главный признак, что плейбук написан правильно.
+- **Inventory (инвентарь)** — файл со списком машин и групп. Бывает INI или YAML.
+- **Playbook (плейбук)** — YAML-файл со списком **play** (сценариев). Каждый play применяется к группе хостов и содержит **tasks** (задачи).
+- **Task (задача)** — вызов **модуля** с параметрами. Модуль — это готовая функция (например, `ansible.builtin.file`, `ansible.windows.win_file`).
+- **Module (модуль)** — маленький кусок кода, который Ansible копирует на целевую машину, выполняет и удаляет. Для Linux — `ansible.builtin.*`, для Windows — `ansible.windows.*`.
+- **Idempotency (идемпотентность)** — повторный запуск того же плейбука не меняет систему, если она уже в нужном состоянии. Ansible сообщает `ok`, а не `changed`.
+- **Facts (факты)** — сведения о машине (ОС, IP, память), которые Ansible собирает автоматически.
+- **Handler (обработчик)** — задача, которая запускается только если другая задача что-то изменила (например, «перезапустить службу, если конфиг поменялся»).
 
-Транспорт и порты:
+Порты и требования:
 
-```text
-                 UBU01  10.10.10.30   (control node, Ansible)
-                  |                 |
-        SSH TCP/22|                 |WinRM TCP/5985 (HTTP) или TCP/5986 (HTTPS)
-                  v                 v
-             ASTRA01            DC01 10.10.10.10
-             10.10.10.31        FS01 10.10.10.20
-             (Linux, sshd)      (Windows, WinRM + PowerShell)
+| Что | Linux | Windows |
+|-----|-------|---------|
+| Транспорт | SSH | WinRM |
+| Порт | 22 | 5985 (HTTP) / 5986 (HTTPS) |
+| Учётка | `adm.student` + sudo | `adm.student` (админ) |
+| Что нужно на целевой | SSH-сервер, Python 3 | WinRM, PowerShell 3+ |
 
-  Playbook (YAML)  ->  task  ->  модуль  ->  копия на хост  ->  выполнение
-                                          <- JSON-результат <-
-```
-
-По модели OSI это всё уровень приложения (L7): SSH и WinRM — прикладные протоколы поверх TCP. Ansible не изобретает свой протокол — поэтому и не нужен агент.
-
-**Почему с Windows всё сложнее.** Windows «из коробки» не умеет SSH (точнее, OpenSSH-сервер есть как опциональный компонент, но Ansible-модули для Windows написаны под WinRM). WinRM — это реализация WS-Management от Microsoft: удалённое выполнение PowerShell по HTTP/HTTPS. Ansible ходит туда через Python-библиотеку **pywinrm**. Ей нужен один из механизмов аутентификации: `basic` (логин/пароль в открытом виде — только по HTTPS), `ntlm` (хэш пароля, работает без Kerberos — наш случай) или `kerberos` (нужен домен-joined control node, у нас его нет).
+На стенде Python 3 на UBU01 уже есть (Ubuntu 24.04 ставит его по умолчанию). На Windows 10/11 PowerShell 5.1 тоже есть. Не хватает только WinRM — его надо включить.
 
 ## 3. Аналогия из жизни
 
-Ansible — это прораб с бланком наряда. У прораба есть список объектов (inventory) и типовой перечень работ: «покрасить забор», «вкрутить лампочку» (модули). Он приезжает на объект, смотрит глазами: забор уже покрашен? Тогда не красит, ставит галочку «ok». Не покрашен — красит и пишет «changed». Приехал второй раз — снова ноль изменений, потому что работа сделана.
+Представь, что ты — бригадир, а у тебя десять квартир, в каждой надо повесить полку. Можно ходить с молотком и гвоздями по каждой квартире (руками). А можно написать **инструкцию**: «в квартире №1 полка на высоте 1.5 м, в квартире №2 — на 1.6 м, гвоздь 60 мм». Отдаёшь инструкцию прорабу (Ansible), он идёт по списку квартир (inventory), в каждой делает что написано (task), и если полка уже висит на нужной высоте — ничего не трогает (идемпотентность). Если ты поменял высоту в инструкции — прораб перевесит только там, где надо.
 
-Плохой прораб — это `shell`/`command`: он не смотрит, а просто каждый раз красит заново, и забор в итоге облупился в три слоя.
-
-Аналогия перестаёт работать в одном месте: у настоящего прораба бригада и объекты параллельно, а Ansible по умолчанию обходит хосты по очереди (параллельность задаётся параметром `forks` в `ansible.cfg`).
+Аналогия ломается на одном: прораб не «думает», он выполняет ровно то, что написано. Если в инструкции ошибка — он аккуратно и быстро сломает все десять квартир одинаково.
 
 ## 4. Практика и команды
 
-Все команды — на **UBU01**, из каталога проекта `~/ansible-vektor`.
+Все команды — на **UBU01** под `adm.student`, если не сказано иное. Ansible ставим из репозитория Ubuntu через `apt`.
 
-**1. Установка и версия**
+### 4.1. Установка Ansible
 
 ```bash
 sudo apt update
-sudo apt install -y ansible python3-pywinrm
+sudo apt install -y ansible
 ansible --version
 ```
 
-`apt install ansible` в Ubuntu 24.04 ставит пакет `ansible` (community-сборка: ядро + популярные коллекции) из репозитория universe [ПРОВЕРИТЬ версию]. `python3-pywinrm` — библиотека для WinRM [ПРОВЕРИТЬ имя пакета]. Альтернатива из официальной документации — `pipx install --include-deps ansible`, тогда pywinrm добавляется через `pipx inject ansible pywinrm`.
-
-Вывод (сокращённо):
+`ansible` — метапакет, ставит `ansible-core` и коллекцию `ansible.builtin`. Вывод примерно:
 
 ```text
 ansible [core 2.16.x]
-  config file = None
+  config file = /etc/ansible/ansible.cfg
   python version = 3.12.x
 ```
 
-Смотрим: `config file = None` — значит `ansible.cfg` ещё нет и берутся умолчания.
+Смотрим версию `core` — от неё зависит синтаксис. Если версия ниже 2.14 — часть модулей может отличаться `[ПРОВЕРИТЬ]`.
 
-**2. Inventory и его проверка**
+### 4.2. Инвентарь
+
+Создай `~/ansible/inventory.ini`:
 
 ```ini
-# ~/ansible-vektor/inventory.ini
 [linux]
-ubu01    ansible_host=10.10.10.30
-astra01  ansible_host=10.10.10.31
+UBU01 ansible_host=10.10.10.30 ansible_user=adm.student
 
 [windows]
-dc01     ansible_host=10.10.10.10
-fs01     ansible_host=10.10.10.20
+WIN11-CL01 ansible_host=10.10.10.51 ansible_user=adm.student ansible_connection=winrm ansible_port=5985 ansible_winrm_transport=ntlm ansible_winrm_server_cert_validation=ignore
 
-[linux:vars]
-ansible_user=<ваш пользователь на UBU01/ASTRA01>
-ansible_become_password="Lab#2026-vektor"
-
-[windows:vars]
-ansible_user=adm.student
-ansible_password="Lab#2026-vektor"
-ansible_connection=winrm
-ansible_port=5986
-ansible_winrm_transport=ntlm
-ansible_winrm_server_cert_validation=ignore
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
 ```
 
-`ansible-inventory -i inventory.ini --graph` — показывает дерево групп. `--list` — то же в JSON со всеми переменными. Смотреть: все 4 хоста на месте, пароли подставились (в `--list` они видны — не запускайте это на чужом экране).
+Разбор:
+- `[linux]`, `[windows]` — группы.
+- `ansible_host` — IP, `ansible_user` — учётка.
+- `ansible_connection=winrm` — сказать Ansible, что это Windows.
+- `ansible_winrm_transport=ntlm` — тип аутентификации; для локальных учёток на не-домене NTLM работает, для домена лучше `kerberos` `[ПРОВЕРИТЬ]`.
+- `ansible_winrm_server_cert_validation=ignore` — только для учебного HTTP-варианта; в бою — HTTPS и проверка сертификата.
 
-**3. Проверка Linux-связности**
+### 4.3. Проверка связи
 
 ```bash
-ansible linux -i inventory.ini -m ansible.builtin.ping
+ansible -i inventory.ini linux -m ansible.builtin.ping
+ansible -i inventory.ini windows -m ansible.windows.win_ping
 ```
 
-`linux` — имя группы, `-m` — модуль. `ping` здесь не ICMP, а «подключился, выполнил Python, получил ответ».
+`ping` (builtin) — не ICMP, а проверка, что Ansible может подключиться и выполнить Python. `win_ping` — то же для Windows через WinRM. Ожидаемо: `SUCCESS => {"ping": "pong"}`.
+
+### 4.4. Сбор фактов
+
+```bash
+ansible -i inventory.ini all -m ansible.builtin.setup -a "filter=ansible_os_family"
+```
+
+`setup` собирает факты. `filter` оставляет только нужное. Вывод примерно:
 
 ```text
-ubu01 | SUCCESS => { "changed": false, "ping": "pong" }
+UBU01 | SUCCESS => { "ansible_facts": { "ansible_os_family": "Debian" } }
+WIN11-CL01 | SUCCESS => { "ansible_facts": { "ansible_os_family": "Windows" } }
 ```
 
-`SUCCESS` + `pong` — канал работает. `UNREACHABLE` — проблема с SSH/сетью, `FAILED` — подключились, но упало внутри (например, нет python3).
+Смотрим `os_family` — по нему в плейбуках делают ветвление.
 
-**4. Проверка Windows-связности**
+### 4.5. Ad-hoc команда на Linux
 
 ```bash
-ansible windows -i inventory.ini -m ansible.windows.win_ping
+ansible -i inventory.ini linux -m ansible.builtin.command -a "uptime" -b
 ```
 
-`ansible.windows.win_ping` — отдельный модуль для Windows, `ansible.builtin.ping` туда не пойдёт (там нет Python). Ответ такой же: `"ping": "pong"`.
+`-m` — модуль, `-a` — аргументы, `-b` — become (sudo). `command` не идемпотентен, поэтому для «сделать один раз» лучше `shell`/`command`, а для состояния — специальные модули.
 
-**5. Ad-hoc сбор фактов**
+### 4.6. Ad-hoc команда на Windows
 
 ```bash
-ansible linux -i inventory.ini -m ansible.builtin.setup -a 'filter=ansible_distribution*'
-ansible windows -i inventory.ini -m ansible.windows.setup -a 'filter=ansible_os_*'
+ansible -i inventory.ini windows -m ansible.windows.win_command -a "hostname"
 ```
 
-`-a` — аргументы модуля. `setup` собирает факты о системе; `filter` оставляет только нужные. Пригодится, когда надо быстро узнать версии ОС по парку без RDP.
+`win_command` — аналог `command` для Windows. Ожидаемо: `WIN11-CL01`.
 
-**6. Ad-hoc команда на Windows**
+### 4.7. Первый плейбук
 
-```bash
-ansible windows -i inventory.ini -m ansible.windows.win_shell -a 'Get-Service Spooler | Select-Object Name,Status'
-```
-
-`win_shell` выполняет строку в PowerShell, `win_command` — запускает exe без shell. Обе **не идемпотентны** — для проверок годятся, для настройки нет.
-
-**7. Сухой прогон плейбука**
-
-```bash
-ansible-playbook -i inventory.ini site.yml --check --diff
-```
-
-`--check` — «показать, что изменилось бы, но не менять»; `--diff` — показать разницу в файлах. Обязательная привычка перед боевым запуском. Учтите: часть модулей в `--check` работает в ограниченном режиме.
-
-**8. Запуск с ограничением по хостам**
-
-```bash
-ansible-playbook -i inventory.ini site.yml --limit fs01 -v
-```
-
-`--limit` — применить только к одному хосту (или группе), `-v/-vv/-vvv` — подробный вывод, нужен при разборе ошибок подключения.
-
-**9. Справка по модулю**
-
-```bash
-ansible-doc ansible.windows.win_copy
-ansible-galaxy collection list | grep -i windows
-```
-
-`ansible-doc` — офлайн-документация по модулю со всеми параметрами. Если `ansible.windows` не найден: `ansible-galaxy collection install ansible.windows`.
-
-**10. Синтаксическая проверка**
-
-```bash
-ansible-playbook -i inventory.ini site.yml --syntax-check
-```
-
-Ловит ошибки YAML и опечатки в именах модулей до подключения к хостам.
-
-**Первый плейбук `site.yml`:**
+`~/ansible/first.yml`:
 
 ```yaml
 ---
-- name: Linux: базовая настройка
+- name: Linux — создать файл-маркер
   hosts: linux
   become: true
-  vars:
-    base_dir: /opt/vektor
   tasks:
-    - name: Показать версию ОС
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: {{ ansible_distribution }} {{ ansible_distribution_version }}"
-
-    - name: Создать каталог
+    - name: Создать /tmp/ansible-marker
       ansible.builtin.file:
-        path: "{{ base_dir }}"
-        state: directory
-        mode: "0755"
-
-    - name: Положить файл-визитку
-      ansible.builtin.copy:
-        content: "Хост {{ inventory_hostname }} управляется Ansible\n"
-        dest: "{{ base_dir }}/info.txt"
+        path: /tmp/ansible-marker
+        state: touch
         mode: "0644"
 
-- name: Windows: базовая настройка
+- name: Windows — создать файл-маркер
   hosts: windows
-  gather_facts: false
   tasks:
-    - name: Проверить доступность
-      ansible.windows.win_ping:
-
-    - name: Создать каталог
+    - name: Создать C:\Temp\ansible-marker.txt
       ansible.windows.win_file:
-        path: C:\Windows\Temp\vektor
-        state: directory
-
-    - name: Положить файл-визитку
-      ansible.windows.win_copy:
-        content: "Хост {{ inventory_hostname }} управляется Ansible\r\n"
-        dest: C:\Windows\Temp\vektor\info.txt
+        path: C:\Temp\ansible-marker.txt
+        state: touch
 ```
 
-`---` — начало YAML-документа; `hosts` — на какую группу; `become: true` — повышение прав через sudo; `{{ ... }}` — подстановка переменной. Задачи выполняются сверху вниз, каждая должна иметь `name` — это ваш отчёт о работе.
+Запуск:
 
-Для Linux нужен SSH-ключ без пароля: `ssh-keygen -t ed25519` и `ssh-copy-id <ваш пользователь>@10.10.10.31`. `ansible_become_password` в inventory — учебный костыль (пароль лежит открытым текстом); в нормальной среде делают отдельного сервисного пользователя с `NOPASSWD` в sudoers только на нужные команды.
+```bash
+ansible-playbook -i inventory.ini first.yml
+```
+
+Первый запуск: `changed=1` в каждой группе. Второй запуск: `ok=1, changed=0` — идемпотентность в действии.
+
+### 4.8. Проверка синтаксиса и «сухой прогон»
+
+```bash
+ansible-playbook -i inventory.ini first.yml --syntax-check
+ansible-playbook -i inventory.ini first.yml --check --diff
+```
+
+`--syntax-check` — только парсинг YAML. `--check` — прогон без изменений (dry-run), `--diff` — показать, что бы изменилось. Не все модули поддерживают `--check`, но `file`/`win_file` поддерживают.
+
+### 4.9. Включение WinRM на Windows (через PowerShell от админа)
+
+На WIN11-CL01 и WIN10-CL02 (позже — на DC01, FS01):
+
+```powershell
+Enable-PSRemoting -Force -SkipNetworkProfileCheck
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value "10.10.10.30" -Force
+```
+
+`Enable-PSRemoting` включает службу WinRM и настраивает слушатель на 5985. `TrustedHosts` нужен, если нет домена (до L1 №42) — иначе клиент не доверяет UBU01. После L1 №42 и ввода в домен это можно убрать.
+
+Проверка с UBU01:
+
+```bash
+curl -s http://10.10.10.51:5985/wsman | head -1
+```
+
+Ожидаемо: пустой ответ или 401 — значит порт открыт. Если `Connection refused` — WinRM не запущен или брандмауэр режет.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- `UBU01` 10.10.10.30 — Ubuntu Server 24.04, доступ по SSH, есть выход в интернет через NAT.
-- `ASTRA01` 10.10.10.31 — Astra Linux, SSH включён.
-- `DC01` 10.10.10.10 и `FS01` 10.10.10.20 — Windows Server 2022, домен `corp.vektor.lab`, учётка `adm.student`.
-- Все машины в сети VMnet8, пингуются друг друга.
-
-> ⚠️ В лабе мы даём Ansible доменную админскую учётку `adm.student` — это удобно, но **небезопасно**. В реальной работе под автоматизацию заводят отдельного сервисного пользователя с минимальными правами (например, только локальный админ на серверах), а пароль хранят в Ansible Vault.
+- Стенд в состоянии **перед L1 №81** по хронологии: DC01 в домене `corp.vektor.lab`, WIN11-CL01 и WIN10-CL02 введены в домен (L1 №44), GPO настроены (L1 №45), FS01 существует (L1 №46), Zabbix временно на UBU01 (L1 №51), на WIN11-CL01 стоит прикладное ПО (L1 №52–61), BitLocker включён (L1 №66), GLPI на UBU01 (L1 №70), Git/PowerShell/Bash/Python пройдены (L1 №77–80).
+- UBU01: Ubuntu Server 24.04, `10.10.10.30`, SSH, `adm.student` с sudo.
+- WIN11-CL01: `10.10.10.51` (DHCP), доменная учётка `ivanov` или `adm.student`.
+- WIN10-CL02: `10.10.10.52` (DHCP), доменная `petrova` или `adm.student`.
+- DC01: `10.10.10.10`, домен `corp.vektor.lab`, `adm.student` — доменный админ.
+- Все ВМ включены, ping между ними проходит (правило ICMPv4 разрешено).
 
 ### Снапшот
 
-В VMware Workstation: выделить ВМ → **VM → Snapshot → Take Snapshot**, имя `before-l1-081`. Сделать на `UBU01`, `DC01`, `FS01` и `ASTRA01`. `WIN11-CL01` и `WIN10-CL02` не затрагиваем — снапшот не нужен.
+В VMware Workstation на каждой затрагиваемой ВМ (**UBU01, WIN11-CL01, WIN10-CL02, DC01**) сделай снапшот с именем `before-l1-081`. Через GUI: правый клик по ВМ → Snapshot → Take Snapshot. Через `vmrun` с хоста:
+
+```powershell
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-081
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-081
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-081
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-081
+```
+
+Для WIN11-CL01 (зашифрована из-за vTPM) добавь пароль шифрования `[ПРОВЕРИТЬ синтаксис]`:
+
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-081
+```
 
 ### Шаги
 
-1. **DC01, PowerShell от администратора** — включить remoting:
-   ```powershell
-   Enable-PSRemoting -Force
-   ```
-   Ожидаемо: `WinRM has been updated to receive requests` и создан HTTP-листener на 5985.
-
-2. **DC01** — выпустить самоподписанный сертификат и повесить HTTPS-листener:
-   ```powershell
-   $cert = New-SelfSignedCertificate -DnsName "dc01.corp.vektor.lab" -CertStoreLocation Cert:\LocalMachine\My
-   New-WSManInstance -ResourceURI winrm/config/Listener -SelectorSet @{Address="*";Transport="HTTPS"} `
-     -ValueSet @{Hostname="dc01.corp.vektor.lab";CertificateThumbprint=$cert.Thumbprint}
-   New-NetFirewallRule -DisplayName "WinRM HTTPS 5986" -Direction Inbound -Protocol TCP -LocalPort 5986 -Profile Domain,Private -Action Allow
-   ```
-   Ожидаемо: без ошибок. Сертификат самоподписанный — поэтому в inventory стоит `ansible_winrm_server_cert_validation=ignore` (в боевой среде сертификат берут у внутреннего CA).
-
-3. **DC01** — проверить, что листener есть:
-   ```powershell
-   winrm enumerate winrm/config/listener
-   ```
-   Ожидаемо: два блока — `Transport = HTTP` (5985) и `Transport = HTTPS` (5986).
-
-4. **FS01** — повторить шаги 1–3, подставив `fs01.corp.vektor.lab`.
-
-5. **UBU01** — установить Ansible и pywinrm (команда из раздела 4, п.1). Ожидаемо: `ansible --version` печатает версию без ошибок.
-
-6. **UBU01** — создать проект:
-   ```bash
-   mkdir -p ~/ansible-vektor && cd ~/ansible-vektor
-   ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
-   ssh-copy-id <ваш пользователь>@10.10.10.31
-   ```
-   Ожидаемо: `ssh <ваш пользователь>@10.10.10.31` заходит без пароля.
-
-7. **UBU01** — создать `inventory.ini` и `ansible.cfg`:
-   ```ini
-   # ansible.cfg
-   [defaults]
-   inventory = ./inventory.ini
-   host_key_checking = False
-   interpreter_python = auto_silent
-   ```
-   Ожидаемо: `ansible-inventory --graph` показывает `@linux: ubu01, astra01` и `@windows: dc01, fs01`.
-
-8. **UBU01** — прогнать ad-hoc проверки из раздела 4 (п.3 и п.4). Ожидаемо: четыре `SUCCESS` с `"ping": "pong"`. Если `dc01`/`fs01` дают `UNREACHABLE` — вернуться к шагу 3 и проверить firewall на порт 5986.
-
-9. **UBU01** — создать `site.yml` из раздела 4 и проверить синтаксис:
-   ```bash
-   ansible-playbook site.yml --syntax-check
-   ```
-   Ожидаемо: `playbook: site.yml` без ошибок.
-
-10. **UBU01** — сухой прогон, затем боевой:
+1. **На UBU01** установи Ansible:
     ```bash
-    ansible-playbook site.yml --check --diff
-    ansible-playbook site.yml
+    sudo apt update && sudo apt install -y ansible
+    ansible --version
     ```
-    Ожидаемо: первый прогон — `changed` на задачах создания каталога и файла; итог `failed=0`. Второй прогон — тот же плейбук даёт `changed=0`. Это и есть идемпотентность.
+    Ожидаемо: строка с `ansible [core 2.16.x]` (или близкая версия).
 
-11. **UBU01** — убедиться в результате:
+2. **На UBU01** создай рабочую папку и инвентарь:
     ```bash
-    ansible linux -m ansible.builtin.command -a 'cat /opt/vektor/info.txt'
-    ansible windows -m ansible.windows.win_shell -a 'Get-Content C:\Windows\Temp\vektor\info.txt'
+    mkdir -p ~/ansible && cd ~/ansible
+    nano inventory.ini
     ```
-    Ожидаемо: по строке с именем каждого хоста.
+    Вставь содержимое из раздела 4.2. Сохрани (`Ctrl+O`, `Enter`, `Ctrl+X`).
 
-12. **Записать в `stand-log.md`**: что сделано, какие листener'ы созданы, где лежат файлы.
+3. **На WIN11-CL01** открой PowerShell от администратора и включи WinRM:
+    ```powershell
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck
+    Set-Item WSMan:\localhost\Client\TrustedHosts -Value "10.10.10.30" -Force
+    Get-Service WinRM
+    ```
+    Ожидаемо: `Status : Running`.
+
+4. **На WIN10-CL02** повтори шаг 3. Ожидаемо: то же самое.
+
+5. **На DC01** повтори шаг 3 (позже пригодится для проверки домена). Ожидаемо: `WinRM` запущен.
+
+6. **На UBU01** проверь связь с Linux:
+    ```bash
+    cd ~/ansible
+    ansible -i inventory.ini linux -m ansible.builtin.ping
+    ```
+    Ожидаемо: `UBU01 | SUCCESS => {"ping": "pong"}`.
+
+7. **На UBU01** проверь связь с Windows:
+    ```bash
+    ansible -i inventory.ini windows -m ansible.windows.win_ping
+    ```
+    Ожидаемо: `WIN11-CL01 | SUCCESS => {"ping": "pong"}`. Если `UNREACHABLE` — вернись к шагу 3, проверь брандмауэр и `TrustedHosts`.
+
+8. **На UBU01** создай `first.yml` из раздела 4.7 и запусти:
+    ```bash
+    ansible-playbook -i inventory.ini first.yml
+    ```
+    Ожидаемо: `changed=1` для каждой группы.
+
+9. **На UBU01** запусти ещё раз:
+    ```bash
+    ansible-playbook -i inventory.ini first.yml
+    ```
+    Ожидаемо: `ok=1, changed=0` — идемпотентность.
+
+10. **Проверка результата**: на UBU01 `ls -l /tmp/ansible-marker`, на WIN11-CL01 `Test-Path C:\Temp\ansible-marker.txt`. Ожидаемо: файл есть, размер 0.
+
+11. **На UBU01** запусти `--check --diff`:
+    ```bash
+    ansible-playbook -i inventory.ini first.yml --check --diff
+    ```
+    Ожидаемо: `ok=1, changed=0` (файлы уже есть).
+
+12. **Запись в журнал**: в `C:\Lab\vektor\stand-log.md` добавь блок «L1 №81: Ansible установлен на UBU01, WinRM включён на WIN11-CL01, WIN10-CL02, DC01, созданы `/tmp/ansible-marker` и `C:\Temp\ansible-marker.txt`».
 
 ### Проверка
 
-- [ ] `ansible --version` и `ansible --version | grep winrm` не дают ошибок
-- [ ] `ansible-inventory --graph` видит 4 хоста в двух группах
-- [ ] `ansible linux -m ping` → `pong` на `ubu01` и `astra01`
-- [ ] `ansible windows -m ansible.windows.win_ping` → `pong` на `dc01` и `fs01`
-- [ ] `winrm enumerate winrm/config/listener` на DC01 и FS01 показывает HTTPS 5986
-- [ ] Первый прогон `site.yml` → `failed=0`, есть `changed`
-- [ ] Второй прогон → `changed=0`
-- [ ] Файлы `/opt/vektor/info.txt` и `C:\Windows\Temp\vektor\info.txt` существуют
-- [ ] Запись в `stand-log.md` сделана
+- [ ] `ansible --version` на UBU01 показывает `core 2.16.x` (или близко).
+- [ ] `ansible -i inventory.ini linux -m ansible.builtin.ping` → `pong`.
+- [ ] `ansible -i inventory.ini windows -m ansible.windows.win_ping` → `pong`.
+- [ ] `Get-Service WinRM` на WIN11-CL01, WIN10-CL02, DC01 → `Running`.
+- [ ] Первый запуск `first.yml` → `changed=1`.
+- [ ] Второй запуск → `changed=0`.
+- [ ] Файлы `/tmp/ansible-marker` и `C:\Temp\ansible-marker.txt` существуют.
+- [ ] Запись в `stand-log.md` сделана.
 
 ### Сломай и почини
 
-**Заявка № 4131.** Пользователь: тимлид ИТ (внутренняя заявка). ВМ: UBU01 / FS01. Что написал: «Твой `site.yml` с ночи валится на FS01 с `UNREACHABLE`. FS01 перезагружали под обновления. Разберись до конца смены, на нём печать висит». Срочность: Высокая.
+**Заявка:**
 
-**Как воспроизвести поломку.** На FS01 (или в его сетевых настройках) сменить сетевой профиль так, чтобы он перестал быть доменным:
+> **Пользователь:** Иван Иванов (бухгалтерия), ВМ WIN11-CL01
+> **Что написал:** «После обеда перестал работать наш новый инструмент — Ansible с UBU01 не подключается к моей машине, пишет UNREACHABLE. До обеда всё работало. Я ничего не трогал.»
+> **Срочность:** высокая
 
-```powershell
-Get-NetConnectionProfile
-Set-NetConnectionProfile -InterfaceIndex <номер> -NetworkCategory Public
-```
-
-Правило firewall `WinRM HTTPS 5986` мы создавали с `-Profile Domain,Private` — на профиле Public порт 5986 закрывается. Плейбук падает.
-
-**Диагностика по шагам (сверху вниз, от простого к сложному):**
-
-1. `ping 10.10.10.20` с UBU01 — хост вообще жив? Если нет — это уже не Ansible, а сеть/питание, эскалация.
-2. `nc -zv 10.10.10.20 5986` (или `Test-NetConnection fs01 -Port 5986` с любой Windows-машины) — порт открыт? `Connection refused/timeout` → идём в firewall.
-3. На FS01: `Get-Service WinRM` — служба `Running`? Если `Stopped`: `Start-Service WinRM; Set-Service WinRM -StartupType Automatic`.
-4. На FS01: `winrm enumerate winrm/config/listener` — HTTPS-листener на месте и с тем же сертификатом?
-5. На FS01: `Get-NetConnectionProfile` — вот и причина: `NetworkCategory = Public`.
-6. На FS01: `Get-NetFirewallRule -DisplayName "WinRM HTTPS 5986" | Get-NetFirewallPortFilter` — убедиться, что правило существует и слушает 5986.
-7. `ansible windows -m ansible.windows.win_ping --limit fs01 -vvv` с UBU01 — при необходимости посмотреть, на каком этапе рвётся.
-
-**Решение:**
+**Как воспроизвести поломку** (на WIN11-CL01, PowerShell от админа):
 
 ```powershell
-Set-NetConnectionProfile -InterfaceIndex <номер> -NetworkCategory DomainAuthenticated
+Stop-Service WinRM
+Set-Service WinRM -StartupType Disabled
 ```
 
-Если FS01 не видит DC, профиль сам не станет доменным — тогда временно `Private` (это уже компромисс), а параллельно чинить доверие к домену (`Test-ComputerSecureChannel`). Затем с UBU01:
+Это имитирует «службу выключили» — например, после обновления или ручной чистки. Заявка совпадает: до этого `win_ping` работал, теперь нет.
+
+**Диагностика (по шагам):**
+
+1. На UBU01:
+    ```bash
+    ansible -i inventory.ini windows -m ansible.windows.win_ping
+    ```
+    Ожидаемо: `WIN11-CL01 | UNREACHABLE! => {"msg": "winrm connection error..."}`.
+
+2. Проверь, что машина вообще жива:
+    ```bash
+    ping -c 2 10.10.10.51
+    ```
+    Ожидаемо: пакеты идут. Значит, сеть в порядке, проблема в WinRM.
+
+3. Проверь порт:
+    ```bash
+    nc -zv 10.10.10.51 5985
+    ```
+    Ожидаемо: `Connection refused` — служба не слушает.
+
+4. На WIN11-CL01 (через консоль VMware, потому что удалённо уже не зайти):
+    ```powershell
+    Get-Service WinRM
+    ```
+    Ожидаемо: `Status : Stopped`, `StartType : Disabled`.
+
+**Решение** (на WIN11-CL01):
+
+```powershell
+Set-Service WinRM -StartupType Automatic
+Start-Service WinRM
+Get-Service WinRM
+```
+
+Ожидаемо: `Running`, `Automatic`.
+
+**Проверка** (на UBU01):
 
 ```bash
-ansible windows -m ansible.windows.win_ping --limit fs01
-ansible-playbook site.yml --limit fs01
+ansible -i inventory.ini windows -m ansible.windows.win_ping
 ```
 
-**Ответ пользователю:** «Разобрался. После перезагрузки FS01 сетевой профиль слетел на «Общественный», и правило файрвола для WinRM перестало применяться — поэтому автоматизация не могла подключиться. Вернул профиль в доменный, проверил: FS01 отвечает, плейбук проходит, печать работает. Причина — профиль сети, не сам Ansible. Рекомендация: после обновлений проверять `Get-NetConnectionProfile` на серверах; могу добавить это в чек-лист.»
+Ожидаемо: `pong`.
 
-**Закрытие заявки:** категория «Сеть / конфигурация», решение — «смена сетевого профиля, проверка firewall-правила», корневая причина — «профиль сети Public после перезагрузки», профилактика — «добавить проверку в пост-обновленческий чек-лист».
+**Ответ пользователю:**
+
+> Иван, добрый день. Причина — на вашей машине была остановлена и отключена служба WinRM (Windows Remote Management). Это та служба, через которую система управления Ansible подключается к компьютеру. Я её включил и поставил в автозапуск. Сейчас всё работает, проверьте, пожалуйста, и напишите, если снова возникнет.
+
+**Закрытие заявки:** категория «Службы Windows», решение «WinRM остановлен и отключён, включён обратно, автозапуск восстановлен», время — 15 минут. В журнал `stand-log.md` добавь строку «WIN11-CL01: WinRM был Disabled, восстановлен в Automatic».
 
 ### Что изменилось на стенде
 
-- `UBU01` (10.10.10.30) — установлены `ansible`, `python3-pywinrm`; создан каталог `~/ansible-vektor` (`inventory.ini`, `ansible.cfg`, `site.yml`); сгенерирован SSH-ключ `~/.ssh/id_ed25519`, ключ скопирован на `ASTRA01`.
-- `DC01` (10.10.10.10) и `FS01` (10.10.10.20) — включён PowerShell Remoting, созданы WinRM листener'ы HTTP/5985 и HTTPS/5986, выпущены самоподписанные сертификаты, добавлено firewall-правило `WinRM HTTPS 5986` (профили Domain, Private).
-- На `UBU01` и `ASTRA01` создан каталог `/opt/vektor` с файлом `info.txt`.
-- На `DC01` и `FS01` создан каталог `C:\Windows\Temp\vektor` с файлом `info.txt`.
-- `DC01`/`FS01` — учётка `adm.student` используется как «сервисная» для Ansible (учебное упрощение).
+- **UBU01**: установлен пакет `ansible` (метапакет, тянет `ansible-core`), создана папка `/home/adm.student/ansible` с `inventory.ini` и `first.yml`, создан файл `/tmp/ansible-marker`.
+- **WIN11-CL01**: включён WinRM (`Enable-PSRemoting`), добавлен `TrustedHosts` для `10.10.10.30`, создан файл `C:\Temp\ansible-marker.txt`.
+- **WIN10-CL02**: включён WinRM, добавлен `TrustedHosts` для `10.10.10.30`.
+- **DC01**: включён WinRM, добавлен `TrustedHosts` для `10.10.10.30`.
+- **Хост**: снапшоты `before-l1-081` на UBU01, WIN11-CL01, WIN10-CL02, DC01; запись в `C:\Lab\vektor\stand-log.md`.
+- **Новых ВМ, ролей, доменов, учёток не появилось.**
 
 ### Откат
 
-VMware Workstation → выбрать ВМ → **VM → Snapshot → Snapshot Manager** → выбрать `before-l1-081` → **Go To** (или **Revert**). Повторить для `UBU01`, `DC01`, `FS01`, `ASTRA01`. Если откатывать не хочется, достаточно удалить каталоги `/opt/vektor` и `C:\Windows\Temp\vektor` и остановить WinRM — но снапшот надёжнее и быстрее.
+В VMware Workstation: правый клик по ВМ → Snapshot Manager → выбери `before-l1-081` → **Revert**. Через `vmrun` с хоста:
+
+```powershell
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-081
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-081
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-081
+vmrun -T ws -vp "Lab#2026-vektor" revertToSnapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-081
+```
+
+После отката не забудь убрать из `stand-log.md` запись про L1 №81, чтобы журнал соответствовал реальному состоянию.
 
 ## 6. Ошибки новичков и безопасность
 
-1. **Пароль в открытом виде в inventory, закоммиченном в Git** → утечка учётки доменного админа в репозиторий. → `ansible-vault encrypt_string 'Lab#2026-vektor' --name 'ansible_password'` и хранить только зашифрованный блок; `inventory.ini` — в `.gitignore`.
-2. **Использовать `adm.student` для автоматизации** → один скомпрометированный файл = весь домен. → Отдельный сервисный аккаунт, права только там, где нужно.
-3. **`hosts: all` без `--limit`** → плейбук «на всякий случай» проходит по DC и роняет прод. → Всегда `--check` и `--limit` на первом прогоне, `hosts` — узкая группа.
-4. **`shell`/`command` для настройки** → плейбук не идемпотентен: файл дописывается, служба перезапускается каждый раз. → Искать штатный модуль (`win_service`, `lineinfile`, `copy`), а `shell` — только для чтения/проверки.
-5. **`ansible_winrm_server_cert_validation: ignore` в боевой среде** → отключается проверка сертификата, возможен MITM. → В лабе допустимо, в работе — сертификат от внутреннего CA или `kerberos`.
-6. **`AllowUnencrypted = true` + `basic` на 5985** → пароль и данные идут открытым текстом. → Только HTTPS 5986 + `ntlm`/`kerberos`.
-7. **Нет снапшота и нет `--check`** → непонятно, что именно сломалось и что откатывать. → Снапшот `before-l1-081` + `--diff` перед запуском.
-8. **`interpreter_python` не настроен / на Astra стоит старый Python** → `FAILED: MODULE FAILURE`. → `ansible -m setup` показывает версию Python; при необходимости `ansible_python_interpreter=/usr/bin/python3`.
+1. **Ошибка:** запускать `ansible-playbook` без `--check` на проде.
+   **К чему приводит:** плейбук с ошибкой в параметре (например, `state: absent` вместо `state: present`) снесёт файл на всех машинах сразу.
+   **Как правильно:** сначала `--syntax-check`, потом `--check --diff`, потом на одной машине (`--limit WIN11-CL01`), потом на всех.
 
-**Безопасность.** Никогда не храните пароли в плейбуках и в Git, не запускайте плейбук по всему парку «на удачу», не открывайте WinRM в интернет и не отключайте файрвол «чтобы работало». В учебном стенде мы ослабили два места (пароль в inventory, игнор сертификата) — оба помечены и оба недопустимы в реальной работе. Пароль `Lab#2026-vektor` — только для этого стенда.
+2. **Ошибка:** хранить пароли в `inventory.ini` открытым текстом.
+   **К чему приводит:** пароль утекает в Git, в бэкапы, в скриншоты.
+   **Как правильно:** `ansible-vault` для секретов, `ansible_ssh_private_key_file` для SSH-ключей. На учебном стенде пароль `Lab#2026-vektor` — только потому что стенд.
+
+3. **Ошибка:** использовать `ansible.builtin.command`/`shell` там, где есть специальный модуль.
+   **К чему приводит:** нет идемпотентности, каждый запуск `changed=1`, скрипт «делает» одно и то же по кругу.
+   **Как правильно:** для файлов — `file`/`copy`/`template`, для пакетов — `apt`/`win_chocolatey`, для служб — `service`/`win_service`.
+
+4. **Ошибка:** забыть `become: true` для задач, требующих root на Linux.
+   **К чему приводит:** `Permission denied` в середине плейбука, часть задач выполнена, часть нет.
+   **Как правильно:** `become: true` на уровне play или task, и проверять `--check` заранее.
+
+5. **Ошибка:** `ansible_winrm_server_cert_validation=ignore` в боевой среде.
+   **К чему приводит:** MITM-атака на WinRM-трафик, перехват учётных данных.
+   **Как правильно:** HTTPS-слушатель WinRM (5986) с валидным сертификатом от внутреннего CA.
+
+6. **Ошибка:** запускать плейбук против группы `all`, когда нужна одна машина.
+   **К чему приводит:** неожиданные изменения на DC01, FS01 и т.д.
+   **Как правильно:** `--limit` или отдельные группы в инвентаре.
+
+7. **Ошибка:** не читать вывод `changed`/`ok`/`failed`.
+   **К чему приводит:** плейбук «прошёл», а по факту упал на середине, и ты этого не заметил.
+   **Как правильно:** смотреть `PLAY RECAP` в конце, `failed=0` — обязательное условие успеха.
+
+### Безопасность
+
+- **Не храни пароли в плейбуках и инвентаре.** В боевой среде — `ansible-vault`, внешние хранилища секретов (HashiCorp Vault, CyberArk), интеграция с AD.
+- **Не отключай проверку сертификата WinRM в проде.** На стенде `ignore` — потому что HTTP и самоподписанный, в бою — только HTTPS.
+- **Не давай `adm.student` полные права на всё.** В реальной работе Ansible-учётка — отдельная, с минимально нужными правами (например, только на OU `Компьютеры`).
+- **Не запускай плейбуки с машины, где ты сидишь за чашкой кофе.** Ansible — это «одна команда на 50 машин». Ошибка стоит дорого.
+- **Логируй запуски.** В проде — `log_path` в `ansible.cfg` и/или централизованный сбор логов (в нашем стенде это будет Zabbix/GLPI, но по-хорошему — SIEM).
 
 ## 7. Вопросы на собеседовании
 
-**1. «Чем Ansible отличается от обычных скриптов на PowerShell или Bash?»**
-Ответ: Ansible не требует агента — работает по SSH/WinRM с уже существующими каналами. Главное отличие — декларативность и идемпотентность: я описываю желаемое состояние («служба запущена», «каталог существует»), а не последовательность команд; модуль сам проверяет текущее состояние и меняет только то, что нужно. Скрипт же выполняется целиком каждый раз и обычно не проверяет, сделано ли уже.
-*Что хочет услышать интервьюер:* понимание agentless-модели и идемпотентности, а не заученное «Ansible — это конфигурационный менеджмент».
-*Красный флаг:* «Ansible ставится на каждую машину» или путаница с Puppet/Chef.
+**Вопрос 1. Что такое Ansible и почему его называют agentless?**
 
-**2. «Как Ansible подключается к Windows и что нужно подготовить на стороне хоста?»**
-Ответ: по WinRM через библиотеку pywinrm. На хосте: включён PowerShell Remoting (`Enable-PSRemoting -Force`), поднят листener (5985 HTTP или 5986 HTTPS), открыт порт в файрволе с учётом сетевого профиля, учётка с правами администратора. В inventory: `ansible_connection=winrm`, `ansible_port=5986`, `ansible_winrm_transport=ntlm` (или kerberos), для самоподписанного сертификата — `ansible_winrm_server_cert_validation=ignore`. Ansible для Windows использует модули коллекции `ansible.windows`.
-*Что хочет услышать интервьюер:* WinRM + питон-библиотека + порты + права.
-*Красный флаг:* «по SSH» без уточнения, что OpenSSH-сервер надо отдельно ставить и настраивать; или «через RDP».
+- **Ответ:** Ansible — система управления конфигурациями. Она описывает желаемое состояние инфраструктуры в YAML-файлах (плейбуках) и приводит машины к этому состоянию. Agentless — потому что на управляемых машинах не нужен постоянный агент: Ansible подключается по уже существующим каналам (SSH для Linux, WinRM для Windows), копирует модуль, выполняет его и удаляет. Это снижает порог входа и не требует ставить софт на каждый хост.
+- **Что хочет услышать интервьюер:** понимание, что Ansible не «ходит по SSH и выполняет команды», а использует модули и идемпотентность.
+- **Красный флаг:** «Ansible — это как SSH, только с YAML». Это неполно, теряется суть модулей и идемпотентности.
 
-**3. «Что такое идемпотентность и как её проверить?»**
-Ответ: свойство операции, при котором повторное выполнение не меняет результат. Проверяется вторым прогоном плейбука: должно быть `changed=0`. Ломают её `command`/`shell`/`win_shell`, потому что они не анализируют состояние, а просто выполняют команду.
-*Что хочет услышать интервьюер:* что кандидат реально видел `changed=0` и понимает, зачем это нужно (предсказуемость, безопасные повторные запуски).
-*Красный флаг:* «идемпотентность — это когда скрипт не падает при повторном запуске».
+**Вопрос 2. Что такое идемпотентность и почему это важно?**
 
-**4. «Плейбук падает с UNREACHABLE. Ваши действия?»**
-Ответ: UNREACHABLE — проблема канала, а не задачи. Порядок: ping хоста → проверка порта (22 или 5985/5986) → служба sshd/WinRM запущена → firewall и сетевой профиль → листener и сертификат (Windows) → права/ключи (Linux) → запуск с `-vvv` для деталей. FAILED — это уже другая история: подключились, но упало внутри (нет прав, нет пакета, ошибка в параметрах).
-*Что хочет услышать интервьюер:* чёткий порядок «снизу вверх» и различение UNREACHABLE/FAILED.
-*Красный флаг:* «перезапущу Ansible» или «переустановлю плейбук».
+- **Ответ:** Идемпотентность — свойство операции давать один и тот же результат при повторном выполнении. В Ansible это значит: если система уже в нужном состоянии, повторный запуск плейбука ничего не меняет и сообщает `ok`, а не `changed`. Это критично, потому что позволяет безопасно перезапускать плейбуки, не боясь сломать систему, и видеть, где реально произошли изменения. На стенде я это проверял: первый запуск `first.yml` дал `changed=1`, второй — `changed=0`.
+- **Что хочет услышать интервьюер:** понимание, что идемпотентность — не «фича», а основа безопасной автоматизации.
+- **Красный флаг:** «Идемпотентность — это когда скрипт можно запускать дважды». Неполно, не хватает «и результат не меняется».
 
-**5. «Зачем нужен inventory и чем ad-hoc отличается от playbook?»**
-Ответ: inventory — список управляемых хостов с группами и переменными подключения; без него Ansible не знает, куда идти. Ad-hoc — разовая команда по одному модулю (`ansible -m`), нужна для проверок и быстрых действий. Playbook — YAML-файл с набором задач, версионируется в Git, повторяем и документирован. Правило: если действие понадобится больше одного раза — оно становится плейбуком.
-*Что хочет услышать интервьюер:* что ad-hoc — инструмент диагностики, а не способ настройки.
-*Красный флаг:* «ad-hoc и playbook — одно и то же, просто разный синтаксис».
+**Вопрос 3. Как Ansible управляет Windows и что для этого нужно?**
+
+- **Ответ:** Через WinRM (Windows Remote Management) — встроенный в Windows протокол на базе SOAP/WS-Management, порт 5985 (HTTP) или 5986 (HTTPS). На целевой машине нужно: включить WinRM (`Enable-PSRemoting`), настроить слушатель, при отсутствии домена — добавить управляющую машину в `TrustedHosts`, дать учётке права администратора. В инвентаре указывается `ansible_connection=winrm`, `ansible_winrm_transport=ntlm` (или `kerberos` в домене). Модули для Windows — из коллекции `ansible.windows` (`win_file`, `win_service`, `win_command` и т.д.).
+- **Что хочет услышать интервьюер:** знание, что WinRM — не SSH, и что для Windows нужны отдельные модули.
+- **Красный флаг:** «Ansible работает с Windows по SSH». Не работает без дополнительных костылей (OpenSSH for Windows), и это не стандартный путь.
+
+**Вопрос 4. Чем отличается `command` от `shell` и когда что использовать?**
+
+- **Ответ:** `command` запускает команду напрямую, без shell-обёртки: не работают пайпы, редиректы, переменные окружения, `&&`. `shell` запускает через `/bin/sh` (или PowerShell на Windows), поэтому всё это работает. Оба не идемпотентны — каждый запуск `changed=1`. Использовать их стоит только когда нет специального модуля: например, для `systemctl status` или для вызова утилиты без модуля. Для файлов, пакетов, служб — специальные модули (`file`, `apt`, `service`).
+- **Что хочет услышать интервьюер:** понимание, что `command`/`shell` — «последнее средство», а не основной инструмент.
+- **Красный флаг:** «Всегда использую `shell`, он универсальнее». Это прямой путь к неидемпотентным плейбукам.
+
+**Вопрос 5. Что такое inventory и какие бывают способы его описания?**
+
+- **Ответ:** Inventory — список управляемых хостов и их групп. Бывает статический (INI или YAML-файл) и динамический (скрипт или плагин, который тянет список из внешнего источника — облака, CMDB, LDAP). В статическом INI группы задаются в `[квадратных скобках]`, переменные — через `ansible_host`, `ansible_user` и т.д. или в секции `[group:vars]`. На стенде я использовал статический INI с группами `linux` и `windows`.
+- **Что хочет услышать интервьюер:** что кандидат знает про динамический инвентарь — это признак, что он не только «домашний» Ansible видел.
+- **Красный флаг:** «Inventory — это просто файл со списком IP». Неполно, теряются группы, переменные, динамический инвентарь.
 
 ## 8. Источники (официальная документация)
 
-- **docs.ansible.com** — раздел «Ansible concepts» (inventory, playbook, module); «Ansible playbooks» — введение в YAML-синтаксис; «Windows Remote Management» (WinRM setup, HTTPS listener, `ansible_winrm_transport`); «Ansible Vault» — шифрование секретов. Поиск: `ansible winrm setup windows`, `ansible playbook intro`, `ansible vault encrypt string`.
-- **docs.ansible.com** — коллекция `ansible.windows`: справочник по `win_ping`, `win_copy`, `win_file`, `win_shell`, `win_command`, `setup`. Поиск: `ansible.windows collection modules`.
-- **learn.microsoft.com** — «PowerShell Remoting over WinRM», `Enable-PSRemoting`, `New-WSManInstance`, `winrm enumerate winrm/config/listener`, «Windows Remote Management (WinRM)». Поиск: `about remote troubleshooting`, `winrm listeners powershell`.
-- **ubuntu.com / help.ubuntu.com** — «Ubuntu Server documentation»: установка пакетов, настройка SSH, sudoers. Поиск: `ubuntu server openssh`.
-- **pipx.pypa.io** — официальный способ установки Ansible через `pipx` [ПРОВЕРИТЬ актуальность рекомендации для вашей версии Ansible].
-- Названия пакетов `ansible` и `python3-pywinrm` в репозитории Ubuntu 24.04 и их версии — `[ПРОВЕРИТЬ]` на момент чтения через `apt policy ansible python3-pywinrm`.
+- **Ansible Documentation** (docs.ansible.com) — раздел «Ansible concepts», статья «How Ansible works»; поиск: `ansible how it works`.
+- **Ansible Documentation** — раздел «Using Ansible inventory», статья «How to build your inventory»; поиск: `ansible inventory ini yaml`.
+- **Ansible Documentation** — раздел «Using Ansible playbooks», статья «Ansible playbooks»; поиск: `ansible playbook yaml syntax`.
+- **Ansible Documentation** — коллекция `ansible.windows`, раздел «Windows Remote Management»; поиск: `ansible windows winrm setup`.
+- **Microsoft Learn** (learn.microsoft.com) — раздел «Windows Remote Management», статья «Installation and Configuration for Windows Remote Management»; поиск: `winrm installation configuration`.
+- **Ansible Documentation** — раздел «Ansible Vault», статья «Encrypting content with Ansible Vault»; поиск: `ansible vault encrypt`.
+- **Ansible Documentation** — раздел «Working with playbooks», статья «Validating tasks: check mode and diff mode»; поиск: `ansible check mode diff`.
+
+Версии `ansible-core` и точный синтаксис `vmrun -vp` для зашифрованных ВМ — `[ПРОВЕРИТЬ]` в твоей версии VMware Workstation и Ubuntu 24.04.

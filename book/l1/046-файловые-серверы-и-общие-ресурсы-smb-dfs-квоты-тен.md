@@ -2,432 +2,483 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-В очереди заявок новая строка:
+Заявка в учебную папку `C:\Support\Tickets`:
 
-> **Пользователь:** ivanov (Иван Иванов, бухгалтерия)
-> **ВМ:** WIN11-CL01
-> **Что написал:** «Здравствуйте! Не открывается папка `\\FS01\Buh` — пишет "Отказано в доступе". Вчера всё работало. Мне сегодня сдавать отчёт, очень срочно!»
-> **Срочность:** высокая
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02
+> **Что написала:** «Не могу открыть папку отдела кадров на сервере. Пишет "Отказано в доступе". Вчера всё работало, я ничего не меняла. Срочно, до обеда нужно отдать приказ на подпись.»
+> **Срочность:** Высокая
 
-Знакомая картина? Заявки «не открывается папка», «пропал файл», «диск на сервере переполнен», «восстановите документ, я его перезаписал» — это, наверное, половина всей работы первой линии в любой российской компании. Люди работают не в облаке, а на общих сетевых дисках: бухгалтерия на `\\FS01\Buh`, HR на `\\FS01\HR`, общие документы на `\\FS01\Obshchee`. Пока всё работает — никто не замечает. Как только перестало — звонит бухгалтер, и у него горит.
+Заявки «не открывается сетевая папка», «пропал доступ к общему диску», «файл занят другим пользователем», «случайно удалил документ, восстановите» — это, наверное, половина всех обращений в L1 в любой московской компании. Пользователи работают не в локальных файлах, а на общих сетевых ресурсах: бухгалтерия — в папке с проводками, HR — в папке с приказами, склад — в папке с накладными. Как только доступ к папке ломается, у человека останавливается работа, и звонок идёт на первую линию.
 
-После этой главы ты будешь уметь: поднять с нуля файловый сервер и ввести его в домен (у нас на стенде появляется **FS01**); создать общие папки с правильными правами доступа через группы AD; понять, почему у одного доступ есть, а у другого нет; посмотреть, кто занял файл, и освободить его; поставить квоту, чтобы один отдел не забил весь диск; включить теневые копии и восстановить документ, который пользователь случайно перезаписал; собрать всё под одним коротким именем через DFS. И, что важно для L1, — уверенно диагностировать «отказано в доступе» за 5–7 шагов, а не за час перебора.
+После этой главы ты будешь понимать, как устроен общий доступ к файлам в Windows (протокол SMB), как сервер отдаёт папку в сеть, как права NTFS и права на общий ресурс работают вместе, как ограничить размер папки квотой и как включить теневые копии, чтобы пользователь сам мог достать случайно удалённый файл. Ты научишься за минуту определять, где именно сломался доступ: сеть, DNS, права, кэш учётных данных или сам сервер. И сможешь уверенно закрывать типовые заявки, не эскалируя их на L2.
+
+Важно: в этой главе мы создаём **FS01** — файловый сервер компании «Вектор». До этого урока его не существует, все общие папки живут на рабочих машинах и на DC01, и это неправильно. С этого урока файлы компании переезжают на отдельный сервер.
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-Общий сетевой диск — это не «папка на сервере», как думает пользователь. Это **сетевая файловая система**, работающая по протоколу **SMB (Server Message Block)** — он же «Сетевая папка Windows», он же раньше назывался CIFS. Клиент (проводник Windows, `net use`, Linux-модуль `cifs`) открывает TCP-соединение с сервером и дальше передаёт по нему команды: «открой файл», «прочитай 64 КБ», «дай список файлов в папке», «заблокируй файл на запись».
+**SMB (Server Message Block)** — протокол, по которому Windows-клиент обращается к сетевым папкам и принтерам. Работает поверх TCP, порт **445** (старый NetBIOS-порт 139 сейчас почти не используется). Когда пользователь открывает `\\FS01\Buh`, клиент по SMB:
+1. Находит FS01 (через DNS — зона `corp.vektor.lab` уже есть с урока 34);
+2. Устанавливает TCP-соединение на 445;
+3. Проходит аутентификацию (в домене — Kerberos, вне домена — NTLM);
+4. Запрашивает список файлов и читает их.
 
+**Общий ресурс (share)** — это папка на сервере, которую сервер «выставил» в сеть под сетевым именем. У шара есть свои права (Share permissions): обычно `Read`, `Change`, `Full Control`. **Права NTFS** — это права на саму папку и файлы в файловой системе. Работает правило: **итоговое право = самое строгое из двух**. Если на шаре `Full Control`, а на NTFS у пользователя только `Read` — он прочитает, но не запишет. Если на шаре `Read`, а на NTFS `Full Control` — он всё равно только прочитает. Классическая ошибка новичка — «дал полный доступ на шару, а пользователь всё равно не может писать» — это как раз про NTFS.
+
+**Скрытые шары** — с символом `$` в конце имени (`C$`, `ADMIN$`, `IPC$`). Они не видны в «Сети», но доступны по прямому пути. `C$` — административный доступ к диску C:, есть на любой Windows-машине у локальных админов.
+
+**DFS (Distributed File System)** — надстройка над SMB, которая позволяет собрать несколько шаров с разных серверов в одно «пространство имён» вида `\\corp.vektor.lab\Files\Buh`. Пользователь видит один путь, а физически файлы могут лежать на разных серверах. Для L1 важно понимать: если пользователь говорит «у меня путь `\\corp.vektor.lab\Files\...`», это DFS, и реальная папка может быть на другом сервере. На нашем стенде DFS не разворачиваем (это тема L2), но знать, что это такое, нужно — вопрос на собеседовании почти гарантирован.
+
+**Квоты (FSRM — File Server Resource Manager)** — механизм ограничения размера папки или тома. Пользователь заполняет папку и получает «Диск заполнен», хотя на сервере места полно. L1 должен уметь посмотреть квоту и объяснить пользователю, что происходит.
+
+**Теневые копии (Shadow Copies / VSS)** — мгновенные снимки тома, которые Windows Server делает по расписанию. Пользователь может сам через свойства папки → «Предыдущие версии» открыть версию файла на час назад и восстановить удалённое. Это спасает от 80% заявок «удалил файл, верните».
+
+Схема того, как это выглядит на стенде:
+
+```text
+   WIN11-CL01 (10.10.10.51)          WIN10-CL02 (10.10.10.52)
+   ivanov, домен VEKTOR              petrova, домен VEKTOR
+        |                                  |
+        |  SMB (TCP 445)                   |  SMB (TCP 445)
+        v                                  v
+   +---------------------------------------------+
+   |   FS01 (10.10.10.20, Windows Server 2022)   |
+   |   роль: File Server                          |
+   |   шары: Obshchee, Buh, HR                    |
+   |   NTFS-права на группы GG-*                  |
+   |   квота на Buh, теневые копии на томе        |
+   +---------------------------------------------+
+                       ^
+                       |  DNS-запрос FS01.corp.vektor.lab
+                       |
+                  DC01 (10.10.10.10)
+                  AD DS + DNS
 ```
- WIN11-CL01 (ivanov)                    FS01 10.10.10.20
-+-------------------+                 +--------------------------------------+
-| explorer.exe      |   TCP 445       |  служба "Сервер" (LanmanServer)      |
-| \\FS01\Buh        | --------------->|    |                                 |
-| клиент SMB 3.1.1  |   SMB 3.1.1     |    v                                 |
-+-------------------+                 |  SMB-шара "Buh"  -> права на шару    |
-                                      |    |                                 |
-                                      |    v                                 |
-                                      |  NTFS-права на C:\Shares\Buh         |
-                                      |    |                                 |
-                                      |    v                                 |
-                                      |  том C: + теневые копии (VSS)        |
-                                      |  + квота FSRM на папку               |
-                                      +--------------------------------------+
-```
-
-**Порты.** Основной — **TCP 445**. Старые версии ходили через NetBIOS: **TCP 139**, а также UDP 137/138 — в 2026 году это рудимент, и NetBIOS держат только ради очень древнего софта. Управление шарами, квотами и DFS с оснасток идёт через RPC (TCP 135 + динамические порты) и WMI. Если файрвол на сервере режет 445 — пользователь видит «не удаётся подключиться», а не «отказано в доступе». Это важнейшее различие для диагностики: **ошибка доступа = сеть работает, права нет; ошибка сети = права ни при чём**.
-
-**Версии SMB.** SMB 1.0 — дырявый и выключен по умолчанию в Windows Server 2022 и Windows 11 (правильно, не включай). SMB 2.0/2.1 — Windows Vista/7. SMB 3.x — Windows 8/Server 2012 и новее: появились шифрование (`EncryptData`), SMB Signing, SMB Direct, Multichannel и политики. У нас Windows 11 и Windows Server 2022 — в `Get-SmbConnection` увидишь диалект **3.1.1**.
-
-**Шара (share) vs NTFS-права.** Здесь спотыкается 90% новичков. На один и тот же объект действуют **два независимых уровня разрешений**:
-
-| Уровень | Где задаётся | К чему применяется | Гранулярность |
-|---|---|---|---|
-| Права на шару | Свойства папки → «Доступ» → «Дополнительно»; `Grant-SmbShareAccess` | Только к доступу **через сеть** | Read / Change / Full Control |
-| NTFS-права | Вкладка «Безопасность»; `icacls`, `Get-Acl` | К доступу **всегда** (и локально, и по сети) | Полный набор + наследование + Deny |
-
-Итоговые права = **самое строгие из двух**. Пример: на шаре дали Change, а в NTFS — Read: пользователь по сети получит только чтение. Наоборот не бывает. Классическая промышленная схема: на шаре «пустить всех доменных пользователей» с Change, а реальное разграничение делать только в NTFS через группы AD. Так проще: права живут в одном месте, а не в двух.
-
-**DFS (Distributed File System)** — это надстройка, два разных механизма, их постоянно путают:
-- **DFS Namespaces (DFS-N)** — «ярлык/навигатор». Пользователь заходит на `\\corp.vektor.lab\Shares`, а внутри видит папки, которые физически лежат на разных серверах. Переехал сервер — поменял один таргет, пользователи ничего не заметили. Адресация не ломается.
-- **DFS Replication (DFS-R)** — «синхронизация». Копирует содержимое папки между серверами. На стенде нам нужно только DFS-N, репликация — тема L2.
-
-**Квоты.** Есть два механизма: **NTFS-квоты** (на том, с точностью до пользователя, только по объёму) и **FSRM — File Server Resource Manager** (квоты на **папку**, мягкие/жёсткие, с уведомлениями, плюс ещё фильтры файлов и отчёты). На практике применяют FSRM: нужна квота на `C:\Shares\Buh`, а не на весь диск. **Жёсткая (hard)** квота просто отказывает в записи; **мягкая (soft)** только пишет в журнал и шлёт письмо — пользователь продолжает работать.
-
-**Теневые копии (VSS, Volume Shadow Copy Service)** — механизм, который на уровне тома запоминает **старые версии изменённых блоков** (copy-on-write). Файл перезаписали — предыдущее содержимое осталось в снапшоте. Клиент видит это как вкладку **«Предыдущие версии» (Previous Versions)** в свойствах файла или папки. Ограничения, которые надо знать: снапшотов на том максимум **64**, по умолчанию расписание — два раза в день (около 7:00 и 12:00) [ПРОВЕРИТЬ точное время в вашей сборке], и место под них по умолчанию ограничено примерно 10% тома. И главное: **это не бэкап** — умрёт диск, умрут и снапшоты вместе с ним.
 
 ## 3. Аналогия из жизни
 
-Представь склад с комнатами. **Шара** — это дверь в комнату «Бухгалтерия» с табличкой и кодовым замком: пустили внутрь или нет. **NTFS-права** — это замки на конкретных шкафах уже внутри комнаты: в комнату вошёл, но шкаф с зарплатами не откроешь. Причём если тебя не пустили в комнату, наличие ключа от шкафа ничего не даст — вот это и есть «эффективные права = самое строгое из двух». **DFS** — это карта на стене проходной: «Бухгалтерия — крыло Б, 2 этаж», и когда отдел переезжает в другое крыло, меняют надпись на карте, а не объясняют каждому сотруднику новый маршрут. **Квота** — ограничение по весу сумки: больше 2 ГБ не пронесёшь, охрана развернёт. **Теневая копия** — ежедневная фотография комнаты: разбили вазу — можно посмотреть, как было вчера.
+Представь офисное здание с архивом. **Шар** — это дверь в комнату архива, на которой висит табличка «Бухгалтерия». **Права на шару** — это пропуск на вход в комнату: пустят или нет. **Права NTFS** — это уже внутри комнаты: к каким полкам можно подходить, какие папки открывать, можно ли что-то положить или только взять. Если у тебя нет пропуска на вход — ты не попадёшь внутрь, даже если знаешь, где лежит нужная папка. Если пропуск есть, но к полке подходить нельзя — ты войдёшь, но нужную папку не возьмёшь. **Квота** — это ограничение на количество коробок, которое отдел может поставить в свою комнату. **Теневая копия** — это фотография комнаты, сделанная час назад: если кто-то вынес коробку, по фотографии видно, где она стояла, и её можно вернуть.
 
-Где аналогия ломается: фотография делается не целиком, а только «что изменилось с прошлого раза», поэтому снапшоты дешевле, чем кажется, — но именно поэтому же они не спасут, если сгорит само здание, то есть диск.
+Аналогия перестаёт работать, когда мы вспоминаем про **наследование прав**: в реальном архиве у новой коробки нет «родительской полки», а в NTFS у нового файла права наследуются от папки, и это ломает интуицию «я же дал доступ на папку».
 
 ## 4. Практика и команды
 
-### 4.1. `Test-NetConnection` — есть ли вообще SMB-порт
+Все команды ниже — на FS01 (PowerShell от админа) или на клиентах (WIN11-CL01, WIN10-CL02). Где применимо — GUI-путь.
 
+**1. Проверить, что FS01 отвечает по SMB (с клиента).**
 ```powershell
 Test-NetConnection -ComputerName FS01 -Port 445
 ```
+`-Port 445` — проверяем именно SMB. Ожидаемо: `TcpTestSucceeded : True`. Если `False` — проблема в сети/файрволе, а не в правах. Это первое, что проверяем по любой заявке «не открывается папка».
 
-Смотрим `TcpTestSucceeded : True`. Если `False` — проблема в сети/файрволе, права можно не проверять. С этого начинается **любая** заявка про «не открывается папка».
-
-### 4.2. `net view` / `net use` — что видит клиент
-
-```cmd
-net view \\FS01
-net use
-```
-
-Сокращённый вывод `net view`:
-
-```text
-Общий ресурс на \\FS01
-
-Share name   Type  Used as  Comment
--------------------------------------------------------------------------------
-Buh          Disk
-HR           Disk
-Obshchee     Disk
-IPC$         IPC             Удаленный IPC
-```
-
-`net use` показывает **уже подключённые** диски и под какой учёткой. Частая причина «нет доступа» — пользователь подключился под другой учёткой (например, локальной), и Windows держит старое соединение.
-
-### 4.3. `Get-SmbShare` / `New-SmbShare` — список и создание шар (на сервере)
-
+**2. Посмотреть список шар на сервере.**
 ```powershell
 Get-SmbShare
-New-SmbShare -Name Buh -Path C:\Shares\Buh `
-  -FullAccess "VEKTOR\Domain Admins" `
-  -ChangeAccess "VEKTOR\Authenticated Users"
 ```
+Вывод примерно:
+```text
+Name       Path                          Description
+----       ----                          -----------
+ADMIN$     C:\Windows                    Remote Admin
+C$         C:\                           Default share
+IPC$                                     Remote IPC
+Obshchee   C:\Shares\Obshchee
+Buh        C:\Shares\Buh
+HR         C:\Shares\HR
+```
+Смотрим: наши шары есть, пути правильные. `ADMIN$`, `C$`, `IPC$` — стандартные, их не трогаем.
 
-Смотрим имя, путь и что шара реально существует. `New-SmbShare` создаёт шару, но **не** создаёт папку — путь должен уже быть.
-
-### 4.4. `Get-SmbShareAccess` / `Grant-SmbShareAccess` — права на шаре
-
+**3. Посмотреть права на конкретную шару.**
 ```powershell
 Get-SmbShareAccess -Name Buh
-Grant-SmbShareAccess -Name Buh -AccountName "VEKTOR\GG-Buh" -AccessRight Change -Force
-Revoke-SmbShareAccess -Name Buh -AccountName "VEKTOR\Все" -Force
 ```
-
-Вывод читается по столбцам `AccountName`, `AccessControlType` (Allow/Deny), `AccessRight`. Deny на шаре — почти всегда ошибка, которая «перебивает» все Allow.
-
-### 4.5. `icacls` — NTFS-права из командной строки
-
-```cmd
-icacls C:\Shares\Buh
-icacls C:\Shares\Buh /inheritance:r /grant "VEKTOR\Domain Admins:(OI)(CI)F" /grant "VEKTOR\GG-Buh:(OI)(CI)M"
-```
-
-Ключи: `/inheritance:r` — убрать наследование (иначе права родятся от родителя и всё запутают); `(OI)` — object inherit (файлы), `(CI)` — container inherit (папки), `F` = Full, `M` = Modify, `RX` = Read & Execute, `W` = Write. Смотреть надо на строки без пометки `(I)` — они собственные, `(I)` — унаследованные.
-
-### 4.6. `Get-Acl` — то же самое, но объектом
-
-```powershell
-Get-Acl C:\Shares\Buh | Select-Object -ExpandProperty Access |
-  Format-Table IdentityReference, FileSystemRights, AccessControlType
-```
-
-Удобно грепать по группе: `... | Where-Object IdentityReference -like "*GG-Buh*"`. Если ACE для нужной группы нет — доступ объясняется сразу.
-
-### 4.7. `Get-SmbOpenFile` / `Close-SmbOpenFile` — кто занял файл
-
-```powershell
-Get-SmbOpenFile | Format-Table ClientComputerName, ClientUserName, Path -AutoSize
-Close-SmbOpenFile -FileId 6830700000000001 -Force
-```
-
-Сокращённый вывод:
-
+Вывод примерно:
 ```text
-ClientComputerName ClientUserName  Path
------------------- --------------  ----
-10.10.10.101       VEKTOR\ivanov   C:\Shares\Buh\Отчет_2026.xlsx
+Name  ScopeName  AccountName  AccessControlType  AccessRight
+----  ---------  -----------  -----------------  -----------
+Buh   *          VEKTOR\GG-Buh  Allow            Full
+Buh   *          Everyone       Allow            Read
 ```
+Смотрим: у `GG-Buh` полный доступ, у `Everyone` — только чтение. Если у `Everyone` стоит `Full` — это дыра, надо исправлять.
 
-Сценарий «файл занят другим пользователем, изменить нельзя» решается именно так: находим `Path`, закрываем по `FileId` (после этого пользователь переоткрывает файл), предупреждаем владельца — иначе он потеряет несохранённое.
-
-### 4.8. `Get-SmbSession` — кто вообще подключён к серверу
-
+**4. Посмотреть NTFS-права на папку.**
 ```powershell
-Get-SmbSession | Format-Table ClientComputerName, ClientUserName, Dialect, NumOpens -AutoSize
+Get-Acl C:\Shares\Buh | Format-List
 ```
+Вывод примерно (сокращённо):
+```text
+Path   : Microsoft.PowerShell.Core\FileSystem::C:\Shares\Buh
+Owner  : BUILTIN\Administrators
+Access : VEKTOR\GG-Buh Allow  Modify, Synchronize
+         NT AUTHORITY\SYSTEM Allow  FullControl
+         BUILTIN\Administrators Allow  FullControl
+```
+Смотрим: `GG-Buh` имеет `Modify` (изменение). Если у группы нет записи — пользователь не получит доступ, даже если шара открыта.
 
-Помогает перед перезагрузкой сервера: видно, чьи сессии оборвутся, и кому надо написать.
-
-### 4.9. `Get-SmbConnection` — с клиента, какая версия SMB
-
+**5. Проверить, что пользователь реально в группе.**
 ```powershell
-Get-SmbConnection
+Get-ADGroupMember -Identity GG-Buh | Select-Object Name, SamAccountName
 ```
-
-Столбец `Dialect` = `3.1.1` — хорошо. Если увидишь `1.0` или `2.0` — где-то старый NAS или криво настроенный софт, и это надо чинить.
-
-### 4.10. Квоты FSRM
-
+Вывод примерно:
+```text
+Name          SamAccountName
+----          --------------
+Иван Иванов   ivanov
+```
+Если пользователя нет — добавляем (это уже задача админа, но L1 должен уметь проверить):
 ```powershell
-Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
-New-FsrmQuota -Path C:\Shares\Buh -Size 2GB -SoftLimit
-Get-FsrmQuota
+Add-ADGroupMember -Identity GG-Buh -Members ivanov
 ```
 
-`-SoftLimit` — только уведомляет; без него квота жёсткая. `Get-FsrmQuota` показывает порог, а **занятое место** смотри в оснастке FSRM (Directory Quotas, столбец «Used») — так надёжнее [ПРОВЕРИТЬ, отдаёт ли ваша версия usage через PowerShell].
+**6. Проверить доступ от имени пользователя (с клиента).**
+```powershell
+net use \\FS01\Buh
+```
+Если доступ есть — увидишь `Команда выполнена успешно.`. Если нет — `Системная ошибка 5. Отказано в доступе.` или `Системная ошибка 53. Не найден сетевой путь.` (это уже сеть/DNS).
 
-### 4.11. Теневые копии
+**7. Посмотреть, какие шары сейчас подключены у пользователя.**
+```powershell
+net use
+```
+Вывод примерно:
+```text
+New connections will be remembered.
+Status   Local   Remote              Network
+---------------------------------------------------
+OK       Z:      \\FS01\Buh          Microsoft Windows Network
+```
+Смотрим: если подключение «Unavailable» или с восклицательным знаком — оно устарело, надо `net use Z: /delete` и подключить заново.
 
+**8. Сбросить кэш учётных данных (частая причина «вчера работало»).**
 ```cmd
+cmdkey /list
+cmdkey /delete:FS01
+```
+`cmdkey /list` — показывает сохранённые учётки. `cmdkey /delete:FS01` — удаляет сохранённую учётку для FS01. После этого при следующем обращении Windows спросит пароль заново и возьмёт актуальные права.
+
+**9. Посмотреть квоту на папку (FS01).**
+```powershell
+Get-FsrmQuota -Path C:\Shares\Buh
+```
+Вывод примерно:
+```text
+Path          : C:\Shares\Buh
+Size          : 5 GB
+Usage         : 3.2 GB (64%)
+SoftLimit     : False
+```
+Смотрим: `Usage` близко к `Size` — пользователь скоро упрётся. Если `Get-FsrmQuota` не находится — роль FSRM не установлена (это делается в лабораторной).
+
+**10. Посмотреть теневые копии (FS01).**
+```powershell
 vssadmin list shadows /for=C:
-vssadmin list shadowstorage
 ```
+Вывод примерно:
+```text
+Contents of shadow copy set ID: {...}
+   Shadow Copy ID: {...}
+   Creation Time: 12/15/2025 10:00:00 AM
+   Shadow Copy Volume: \\?\Volume{...}
+```
+Смотрим: есть ли свежие копии (за последние сутки). Если список пуст — теневые копии не настроены, и «восстановить удалённое» не получится.
 
-Первая показывает, какие снапшоты есть и когда сделаны; вторая — сколько места им разрешено. Создать снапшот из консоли можно командой `vssadmin create shadow /for=C:` (на серверных ОС доступна; на клиентских Windows, как правило, нет — там пользуйся GUI), либо через PowerShell:
+**11. GUI-путь для пользователя (теневые копии).**
+На клиенте: правый клик по сетевой папке → **Свойства** → вкладка **Предыдущие версии** → выбрать дату → **Открыть** или **Восстановить**. Это то, что L1 объясняет пользователю по телефону.
 
+**12. GUI-путь для админа (создание шары).**
+На FS01: **Server Manager** → **File and Storage Services** → **Shares** → **Tasks** → **New Share** → **SMB Share – Quick** → указать путь `C:\Shares\Buh` → имя `Buh` → права. Или через PowerShell:
 ```powershell
-Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create `
-  -Arguments @{ Volume = "C:\"; Context = "ClientAccessible" }
+New-SmbShare -Name Buh -Path C:\Shares\Buh -FullAccess "VEKTOR\GG-Buh"
 ```
-
-В GUI: **Управление компьютером → Управление дисками → правый клик по тому → Свойства → вкладка «Теневые копии»**. Именно `ClientAccessible` делает их видимыми пользователю во вкладке «Предыдущие версии».
-
-### 4.12. Linux: `smbclient` и `mount.cifs`
-
-```bash
-sudo apt install -y smbclient cifs-utils
-smbclient -L //10.10.10.20 -U ivanov
-sudo mkdir -p /mnt/buh
-sudo mount -t cifs //10.10.10.20/Buh /mnt/buh \
-  -o username=ivanov,domain=VEKTOR,vers=3.0,uid=$(id -u),gid=$(id -g)
-mount | grep cifs
-```
-
-`-L` — список шар на сервере, `-U` — пользователь (пароль спросит). `domain=VEKTOR` обязателен, иначе сервер попробует локальную учётку. `vers=3.0` можно попробовать поднять до `3.1.1`.
-
-### 4.13. DFS Namespace
-
-```powershell
-Install-WindowsFeature -Name FS-DFS-Namespace -IncludeManagementTools
-New-DfsnRoot -Path \\corp.vektor.lab\Shares -TargetPath \\FS01\Obshchee -Type DomainV2
-New-DfsnFolder -Path \\corp.vektor.lab\Shares\Buh -TargetPath \\FS01\Buh
-Get-DfsnRoot -Path \\corp.vektor.lab\Shares
-```
-
-Проверка: с клиента открыть `\\corp.vektor.lab\Shares\Buh` — попадёшь в `\\FS01\Buh`, не зная, что это FS01.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **DC01** (10.10.10.10): AD DS, DNS, DHCP, домен `corp.vektor.lab`, структура OU `Company` → `Бухгалтерия`, `HR`, `Склад`, `IT`, `Компьютеры`, `Серверы`. Есть пользователи `ivanov`, `petrova`, `sidorov` и группы `GG-Buh`, `GG-HR`, `GG-Sklad`, `GG-IT`.
-- **WIN11-CL01** — в домене, рабочее место `ivanov`. **WIN10-CL02** — в домене, рабочее место `petrova`.
-- **UBU01** (10.10.10.30) — Ubuntu Server 24.04, статический адрес, доступ по SSH.
-- **FS01 ещё не существует** — создаём в этой лабораторной. Дистрибутив Windows Server 2022 Evaluation в режиме **Desktop Experience**. Из РФ скачивание с `microsoft.com` может быть ограничено; легальная альтернатива — пробная версия с портала Microsoft Evaluation Center, доступная через партнёров, либо учебные программы вузов. Пиратские сборки не используем.
+- **DC01** (10.10.10.10): Windows Server 2022, домен `corp.vektor.lab` развёрнут (урок 42), OU `Company` с подразделениями `Бухгалтерия`, `HR`, `Склад`, `IT`, группы `GG-Buh`, `GG-HR`, `GG-Sklad`, `GG-IT` созданы (урок 43), пользователи `ivanov`, `petrova`, `sidorov` есть, `ivanov` в `GG-Buh`, `petrova` в `GG-HR`.
+- **WIN11-CL01** (10.10.10.51): Windows 11, введена в домен, вход доменной учёткой `VEKTOR\ivanov` работает (урок 44).
+- **WIN10-CL02** (10.10.10.52): Windows 10 LTSC, введена в домен, вход `VEKTOR\petrova` работает.
+- **FS01** — **не существует**. Создаём в этой лабораторной.
+- Пароль стенда: `Lab#2026-vektor`.
 
 ### Снапшот
 
-На **DC01, WIN11-CL01, WIN10-CL02, UBU01** — снимок с именем `before-l1-046` (ВМ выключена или поставлена на паузу, иначе снапшот будет с памятью и «грязным» состоянием). На **FS01** снимок `before-l1-046` делаем сразу после шага 3 — до того, как начнём создавать шары и права.
+Перед началом на хосте в VMware Workstation:
+- На **DC01** — снапшот `before-l1-046`.
+- На **WIN11-CL01** — снапшот `before-l1-046` (через `vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-046` [ПРОВЕРИТЬ синтаксис в твоей версии]).
+- На **WIN10-CL02** — снапшот `before-l1-046`.
+
+FS01 ещё нет — снапшот для неё делаем сразу после установки ОС и базовой настройки (шаг 3).
 
 ### Шаги
 
-1. **На хосте VMware.** Создать ВМ: 2 vCPU, 4 ГБ RAM, диск 60 ГБ, сетевой адаптер — **VMnet8 (NAT)**, ISO Windows Server 2022 Evaluation. Установить с опцией «Desktop Experience», пароль администратора — `Lab#2026-vektor`. Ожидаемо: загрузился рабочий стол Server.
-2. **На FS01.** Переименовать в `FS01`, задать статический адрес: IP `10.10.10.20`, маска `255.255.255.0`, шлюз `10.10.10.2`, DNS `10.10.10.10`. Команда (PowerShell от админа):
-   ```powershell
-   Rename-Computer -NewName FS01 -Restart
-   New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 10.10.10.20 -PrefixLength 24 -DefaultGateway 10.10.10.2
-   Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses 10.10.10.10
-   ```
-   Проверка: `ping dc01.corp.vektor.lab` отвечает — значит DNS смотрит в домен.
-3. **На FS01.** Ввести в домен:
-   ```powershell
-   Add-Computer -DomainName corp.vektor.lab -Credential VEKTOR\adm.student -Restart
-   ```
-   Ожидаемо: после перезагрузки на экране входа доступна учётка `VEKTOR\adm.student`. На **DC01** перенести объект в OU «Серверы»:
-   ```powershell
-   Move-ADObject -Identity "CN=FS01,CN=Computers,DC=corp,DC=vektor,DC=lab" -TargetPath "OU=Серверы,OU=Company,DC=corp,DC=vektor,DC=lab"
-   ```
-   **Снапшот `before-l1-046` на FS01.**
-4. **На FS01.** Создать папки и NTFS-права:
-   ```powershell
-   New-Item -ItemType Directory -Path C:\Shares\Obshchee, C:\Shares\Buh, C:\Shares\HR
-   icacls C:\Shares\Obshchee /inheritance:r /grant "VEKTOR\Domain Admins:(OI)(CI)F" /grant "VEKTOR\Authenticated Users:(OI)(CI)M"
-   icacls C:\Shares\Buh /inheritance:r /grant "VEKTOR\Domain Admins:(OI)(CI)F" /grant "VEKTOR\GG-Buh:(OI)(CI)M"
-   icacls C:\Shares\HR /inheritance:r /grant "VEKTOR\Domain Admins:(OI)(CI)F" /grant "VEKTOR\GG-HR:(OI)(CI)M"
-   ```
-   Ожидаемо: `icacls C:\Shares\Buh` показывает две собственные ACE.
-5. **На FS01.** Создать шары:
-   ```powershell
-   New-SmbShare -Name Obshchee -Path C:\Shares\Obshchee -FullAccess "VEKTOR\Domain Admins" -ChangeAccess "VEKTOR\Authenticated Users"
-   New-SmbShare -Name Buh -Path C:\Shares\Buh -FullAccess "VEKTOR\Domain Admins" -ChangeAccess "VEKTOR\Authenticated Users"
-   New-SmbShare -Name HR -Path C:\Shares\HR -FullAccess "VEKTOR\Domain Admins" -ChangeAccess "VEKTOR\Authenticated Users"
-   Set-SmbShare -Name Buh -FolderEnumerationMode AccessBased -Force
-   Set-SmbShare -Name HR -FolderEnumerationMode AccessBased -Force
-   ```
-   `AccessBased` = ABE: пользователь видит только те папки, куда у него есть доступ. Ожидаемо: `Get-SmbShare` показывает четыре записи (включая `IPC$`).
-6. **На WIN11-CL01 (ivanov).** Проверить доступ:
-   ```cmd
-   net use \\FS01\Buh
-   dir \\FS01\Buh
-   net use \\FS01\HR
-   ```
-   Ожидаемо: `Buh` открывается, `HR` — «Системная ошибка 5. Отказано в доступе». Это **правильный** результат.
-7. **На WIN10-CL02 (petrova).** Зеркальная проверка: `\\FS01\HR` открывается, `\\FS01\Buh` — отказ. Также проверить, что в `\\FS01` видны только разрешённые папки (ABE).
-8. **На FS01.** Создать тестовый файл и посмотреть, кто его держит. Иван оставляет открытым `Отчет_2026.xlsx` на WIN11-CL01, ты на FS01:
-   ```powershell
-   Get-SmbOpenFile | Format-Table ClientComputerName, ClientUserName, Path -AutoSize
-   Get-SmbSession
-   ```
-   Ожидаемо: видна строка с `10.10.10.101`, `VEKTOR\ivanov` и путём к файлу. Закрыть: `Close-SmbOpenFile -FileId <id> -Force`.
-9. **На FS01.** Квота на бухгалтерию:
-   ```powershell
-   Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
-   New-FsrmQuota -Path C:\Shares\Buh -Size 2GB -SoftLimit
-   ```
-   Ожидаемо: `Get-FsrmQuota` возвращает объект с путём `C:\Shares\Buh` и `Size` = 2147483648.
-10. **На FS01.** Теневые копии: GUI — **Управление дисками → правый клик по C: → Свойства → Теневые копии → Включить**, затем «Создать сейчас». Проверка: `vssadmin list shadows /for=C:` показывает хотя бы один снапшот.
-11. **На WIN11-CL01.** Изменить файл в `\\FS01\Buh` (перезаписать содержимое), затем правый клик по файлу → **Свойства → Предыдущие версии** → выбрать снапшот → **Восстановить**. Ожидаемо: вернулось старое содержимое.
-12. **На FS01.** DFS-неймспейс:
+1. **Создать ВМ FS01 в VMware Workstation.** На хосте: **File** → **New Virtual Machine** → **Typical** → **Installer disc image file (iso)** → указать ISO Windows Server 2022 Evaluation → имя ВМ `FS01`, путь `C:\Lab\vektor\VMs\FS01` → диск 60 ГБ (тонкий) → сеть **VMnet8 (NAT)** → **Finish**. Запустить, установить Windows Server 2022 (Desktop Experience). Ожидаемо: установка проходит, после перезагрузки — рабочий стол.
+
+2. **Настроить FS01: имя, адрес, DNS.** В PowerShell на FS01:
     ```powershell
-    Install-WindowsFeature -Name FS-DFS-Namespace -IncludeManagementTools
-    New-DfsnRoot -Path \\corp.vektor.lab\Shares -TargetPath \\FS01\Obshchee -Type DomainV2
-    New-DfsnFolder -Path \\corp.vektor.lab\Shares\Buh -TargetPath \\FS01\Buh
+    Rename-Computer -NewName FS01 -Restart
     ```
-    С WIN11-CL01 открыть `\\corp.vektor.lab\Shares\Buh`. Ожидаемо: тот же контент, что в `\\FS01\Buh`.
-13. **На UBU01.** Проверить доступ из Linux:
-    ```bash
-    sudo apt install -y smbclient cifs-utils
-    smbclient -L //10.10.10.20 -U ivanov
-    sudo mkdir -p /mnt/buh
-    sudo mount -t cifs //10.10.10.20/Buh /mnt/buh -o username=ivanov,domain=VEKTOR,vers=3.0,uid=$(id -u),gid=$(id -g)
-    ls /mnt/buh
+    После перезагрузки:
+    ```powershell
+    New-NetIPAddress -InterfaceAlias "Ethernet0" -IPAddress 10.10.10.20 -PrefixLength 24 -DefaultGateway 10.10.10.2
+    Set-DnsClientServerAddress -InterfaceAlias "Ethernet0" -ServerAddresses 10.10.10.10
     ```
-    Ожидаемо: список файлов бухгалтерии. Не забудь `sudo umount /mnt/buh` в конце.
+    Ожидаемо: `Get-NetIPAddress -AddressFamily IPv4` показывает 10.10.10.20, `Resolve-DnsName FS01.corp.vektor.lab` (после шага 4) отвечает.
+
+3. **Снапшот FS01.** В VMware Workstation: правый клик по FS01 → **Snapshot** → имя `before-l1-046`. Это точка возврата для FS01.
+
+4. **Ввести FS01 в домен.** На FS01:
+    ```powershell
+    Add-Computer -DomainName corp.vektor.lab -Credential (Get-Credential) -Restart
+    ```
+    В окне ввести `VEKTOR\adm.student` и пароль `Lab#2026-vektor`. После перезагрузки войти как `VEKTOR\adm.student`. Ожидаемо: `whoami` возвращает `vektor\adm.student`.
+
+5. **Создать папки и шары.** На FS01 в PowerShell от админа:
+    ```powershell
+    New-Item -ItemType Directory -Path C:\Shares\Obshchee, C:\Shares\Buh, C:\Shares\HR
+    New-SmbShare -Name Obshchee -Path C:\Shares\Obshchee -FullAccess "VEKTOR\Domain Users"
+    New-SmbShare -Name Buh -Path C:\Shares\Buh -FullAccess "VEKTOR\GG-Buh"
+    New-SmbShare -Name HR -Path C:\Shares\HR -FullAccess "VEKTOR\GG-HR"
+    ```
+    Ожидаемо: `Get-SmbShare` показывает три наших шары. На шаре `Buh` — только `GG-Buh` (никакого `Everyone`).
+
+6. **Настроить NTFS-права.** На FS01:
+    ```powershell
+    icacls C:\Shares\Buh /inheritance:r
+    icacls C:\Shares\Buh /grant "VEKTOR\GG-Buh:(OI)(CI)M"
+    icacls C:\Shares\Buh /grant "BUILTIN\Administrators:(OI)(CI)F"
+    icacls C:\Shares\Buh /grant "NT AUTHORITY\SYSTEM:(OI)(CI)F"
+    ```
+    `(OI)` — Object Inherit (файлы), `(CI)` — Container Inherit (папки), `M` — Modify, `F` — Full. Аналогично для `HR` с `GG-HR` и для `Obshchee` с `Domain Users`. Ожидаемо: `icacls C:\Shares\Buh` показывает три записи, `Everyone` нет.
+
+7. **Проверить доступ с WIN11-CL01 (ivanov).** На WIN11-CL01 под `VEKTOR\ivanov`:
+    ```powershell
+    net use Z: \\FS01\Buh
+    dir Z:\
+    ```
+    Ожидаемо: `Команда выполнена успешно`, `dir` показывает пустую папку (или файлы, если создали). Создать тестовый файл:
+    ```powershell
+    "test" | Out-File Z:\test-ivanov.txt
+    ```
+    Ожидаемо: файл создаётся без ошибок.
+
+8. **Проверить, что petrova НЕ имеет доступа к Buh.** На WIN10-CL02 под `VEKTOR\petrova`:
+    ```powershell
+    net use Y: \\FS01\Buh
+    ```
+    Ожидаемо: `Системная ошибка 5. Отказано в доступе.` Это правильно: petrova в `GG-HR`, а не в `GG-Buh`. Проверить доступ к `HR`:
+    ```powershell
+    net use Y: \\FS01\HR
+    ```
+    Ожидаемо: успех.
+
+9. **Установить роль FSRM и настроить квоту на Buh.** На FS01:
+    ```powershell
+    Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
+    New-FsrmQuota -Path C:\Shares\Buh -Size 100MB
+    ```
+    Ожидаемо: `Get-FsrmQuota -Path C:\Shares\Buh` показывает `Size : 100 MB`. Проверить: на WIN11-CL01 от ivanov скопировать в `Z:\` файл больше 100 МБ (например, `fsutil file createnew Z:\big.bin 209715200`). Ожидаемо: ошибка «На диске недостаточно места» [ПРОВЕРИТЬ точный текст в твоей локали].
+
+10. **Включить теневые копии на томе C:.** На FS01:
+    ```powershell
+    vssadmin add shadowstorage /for=C: /on=C: /maxsize=10%
+    vssadmin create shadow /for=C:
+    ```
+    Ожидаемо: `vssadmin list shadows /for=C:` показывает одну копию с текущим временем. В реальной работе это настраивается по расписанию через **Server Manager** → **File and Storage Services** → **Volumes** → правый клик по тому → **Configure Shadow Copies** [ПРОВЕРИТЬ путь в твоей версии].
+
+11. **Проверить восстановление из теневой копии.** На WIN11-CL01 от ivanov: удалить `Z:\test-ivanov.txt`. Затем правый клик по `Z:` → **Свойства** → **Предыдущие версии** → выбрать свежую → **Открыть** → найти `test-ivanov.txt` → скопировать обратно. Ожидаемо: файл восстановлен. Это ровно то, что L1 объясняет пользователю.
+
+12. **Записать в журнал.** В `C:\Lab\vektor\stand-log.md` добавить запись (см. раздел «Что изменилось на стенде»).
 
 ### Проверка
 
-- [ ] `Get-SmbShare` на FS01 показывает `Obshchee`, `Buh`, `HR`
-- [ ] `icacls C:\Shares\Buh` содержит ACE для `VEKTOR\GG-Buh` с `(OI)(CI)(M)`
-- [ ] ivanov открывает `\\FS01\Buh` и получает отказ на `\\FS01\HR`
-- [ ] petrova — наоборот
-- [ ] в `\\FS01` каждый видит только свои папки (ABE работает)
-- [ ] `Get-SmbOpenFile` показывает открытый файл ivanov, `Close-SmbOpenFile` его закрывает
-- [ ] `Get-FsrmQuota` возвращает квоту 2 ГБ на `C:\Shares\Buh`
-- [ ] `vssadmin list shadows /for=C:` показывает снапшот
-- [ ] файл восстановлен через «Предыдущие версии»
-- [ ] `\\corp.vektor.lab\Shares\Buh` открывается с клиента
-- [ ] UBU01 видит содержимое `Buh` через `mount.cifs`
-- [ ] запись в `stand-log.md` сделана
+- [ ] FS01 существует, в домене, адрес 10.10.10.20, DNS 10.10.10.10.
+- [ ] `Get-SmbShare` на FS01 показывает `Obshchee`, `Buh`, `HR`.
+- [ ] `Get-SmbShareAccess -Name Buh` — только `GG-Buh`, без `Everyone`.
+- [ ] `icacls C:\Shares\Buh` — `GG-Buh` с `M`, без `Everyone`.
+- [ ] ivanov с WIN11-CL01 подключает `\\FS01\Buh` и пишет файл.
+- [ ] petrova с WIN10-CL02 получает «Отказано в доступе» на `Buh` и успех на `HR`.
+- [ ] Квота 100 МБ на `Buh` работает (большой файл не копируется).
+- [ ] `vssadmin list shadows /for=C:` показывает копию.
+- [ ] Файл восстановлен из «Предыдущих версий».
 
 ### Сломай и почини
 
-> **Пользователь:** ivanov
-> **ВМ:** WIN11-CL01
-> **Что написал:** «Не открывается папка Бухгалтерия на FS01 — "Отказано в доступе". Раньше открывалась, я ничего не трогал. Очень срочно, закрываю месяц!»
-> **Срочность:** высокая
+**Заявка:**
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02
+> **Что написала:** «Не могу открыть папку отдела кадров `\\FS01\HR`. Пишет "Отказано в доступе". Вчера всё работало, я ничего не меняла. Срочно, до обеда нужно отдать приказ на подпись.»
+> **Срочность:** Высокая
 
-**Воспроизводим поломку** (на FS01, от админа):
-
-```cmd
-icacls C:\Shares\Buh /remove:g "VEKTOR\GG-Buh"
+**Как воспроизвести поломку.** На DC01 от админа удалить petrova из группы `GG-HR`:
+```powershell
+Remove-ADGroupMember -Identity GG-HR -Members petrova -Confirm:$false
 ```
+Это реалистичный сценарий: админ при пересмотре прав случайно убрал не того человека, или пользователь перешёл в другой отдел, а группу не поправили.
 
-Мы убрали ACE группы из NTFS, шару не тронули.
+**Диагностика по шагам.**
 
-**Диагностика по шагам — именно в этом порядке:**
+1. **Проверить сеть и SMB.** На WIN10-CL02:
+    ```powershell
+    Test-NetConnection -ComputerName FS01 -Port 445
+    ```
+    Ожидаемо: `TcpTestSucceeded : True`. Значит, сеть и файрвол в порядке, проблема в правах.
 
-1. **Сеть.** С WIN11-CL01: `Test-NetConnection -ComputerName FS01 -Port 445`. True → сеть и порт в порядке, идём дальше. (Если False — это уже не про права, смотри файрвол на FS01.)
-2. **Ошибка и учётка.** `net use` — видно ли подключение к `\\FS01\Buh` и под какой учёткой. Отключаем и пробуем заново: `net use \\FS01\Buh /delete`, затем `net use \\FS01\Buh`. Ошибка «Системная ошибка 5» = сервер ответил отказом, значит связь есть.
-3. **Группы в токене.** На WIN11-CL01: `whoami /groups | findstr /i GG`. `GG-Buh` на месте → членство не при чём (если бы группу убрали из AD, тут её не было бы, и понадобился бы перелогин/`klist purge`).
-4. **Права на шаре.** На FS01: `Get-SmbShareAccess -Name Buh`. Видим Allow Change для `Authenticated Users` и Full для Domain Admins → шара пускает всех, проблема глубже.
-5. **NTFS.** На FS01: `icacls C:\Shares\Buh`. Строки для `GG-Buh` **нет** — вот причина. Для полноты: `Get-Acl C:\Shares\Buh | Select -Expand Access | ft IdentityReference, FileSystemRights`.
-6. **Починка.**
-   ```cmd
-   icacls C:\Shares\Buh /grant "VEKTOR\GG-Buh:(OI)(CI)M"
-   ```
-7. **Проверка.** С WIN11-CL01: `net use \\FS01\Buh /delete` и заново `net use \\FS01\Buh`, `dir`. Открывается.
+2. **Проверить DNS.** На WIN10-CL02:
+    ```powershell
+    Resolve-DnsName FS01.corp.vektor.lab
+    ```
+    Ожидаемо: отвечает 10.10.10.20. DNS в порядке.
 
-**Что написать пользователю:**
+3. **Проверить, что шара существует и права на ней корректны.** На FS01:
+    ```powershell
+    Get-SmbShareAccess -Name HR
+    ```
+    Ожидаемо: `GG-HR` с `Full`. Шара в порядке.
 
-> Иван, добрый день! Доступ к `\\FS01\Buh` восстановлен — на сервере сбились права на папку. Пожалуйста, закройте окно проводника с этой папкой (или перезайдите в систему) и откройте её заново. Если снова откажет — напишите, посмотрю глубже. Извините за неудобства.
+4. **Проверить NTFS.** На FS01:
+    ```powershell
+    icacls C:\Shares\HR
+    ```
+    Ожидаемо: `GG-HR` с `M`. NTFS в порядке.
 
-**Закрытие заявки:** категория «Файловый сервер → Права доступа», решение «Восстановлена ACE группы GG-Buh в NTFS-ACL папки C:\Shares\Buh», корневая причина «Некорректное изменение прав при обслуживании сервера» — и, что важно, **не** пиши «пользователь сам виноват», если это не доказано.
+5. **Проверить членство в группе.** На DC01:
+    ```powershell
+    Get-ADGroupMember -Identity GG-HR | Select-Object Name, SamAccountName
+    ```
+    Ожидаемо: petrova **отсутствует**. Вот и причина.
+
+6. **Проверить, что у petrova нет устаревшего кэша.** На WIN10-CL02:
+    ```powershell
+    cmdkey /list
+    ```
+    Если есть сохранённая учётка для FS01 — удалить `cmdkey /delete:FS01`. Но в нашем случае причина не в кэше, а в группе.
+
+**Решение.** На DC01:
+```powershell
+Add-ADGroupMember -Identity GG-HR -Members petrova
+```
+На WIN10-CL02 пользователю нужно **выйти и войти заново** (или `klist purge` от админа), потому что членство в группах кэшируется в токене входа. После повторного входа:
+```powershell
+net use Y: \\FS01\HR
+```
+Ожидаемо: успех.
+
+**Ответ пользователю.** «Мария, добрый день. Проблема была в правах доступа: ваша учётная запись по ошибке была исключена из группы отдела кадров. Я вернул вас в группу. Пожалуйста, выйдите из системы и войдите заново — после этого папка `\\FS01\HR` откроется. Если что-то ещё не работает, напишите.»
+
+**Закрытие заявки.** Категория: «Доступ к файловым ресурсам». Решение: «Пользователь восстановлен в группе GG-HR, выполнен повторный вход». Время: 15 минут. Профилактика: при изменении групп всегда проверять, кого именно убираем, и предупреждать пользователя о необходимости повторного входа.
 
 ### Что изменилось на стенде
 
-- Добавлена ВМ **FS01**: Windows Server 2022 Evaluation (Desktop Experience), **10.10.10.20/24**, шлюз 10.10.10.2, DNS 10.10.10.10, введена в домен `corp.vektor.lab`, объект в OU `Серверы`.
+- Создана ВМ **FS01** (Windows Server 2022 Evaluation), адрес 10.10.10.20, DNS 10.10.10.10, введена в домен `corp.vektor.lab`.
 - На FS01 созданы папки `C:\Shares\Obshchee`, `C:\Shares\Buh`, `C:\Shares\HR` и одноимённые SMB-шары.
-- NTFS: `Obshchee` — Authenticated Users Modify; `Buh` — только `GG-Buh` и Domain Admins; `HR` — только `GG-HR` и Domain Admins. Наследование отключено.
-- На шарах `Buh` и `HR` включён режим **ABE** (`FolderEnumerationMode = AccessBased`).
-- Установлена роль **FS-Resource-Manager**, на `C:\Shares\Buh` квота **2 ГБ, soft**.
-- На томе C: FS01 включены **теневые копии** (VSS), создан первый снапшот.
-- Создан доменный **DFS-неймспейс** `\\corp.vektor.lab\Shares` (тип DomainV2), корневой таргет `\\FS01\Obshchee`, папка `Buh` → `\\FS01\Buh`.
-- На **UBU01** установлены пакеты `smbclient`, `cifs-utils`; смонтирован (и размонтирован) `//10.10.10.20/Buh` в `/mnt/buh`.
+- NTFS-права: `Obshchee` — `Domain Users` (Modify), `Buh` — `GG-Buh` (Modify), `HR` — `GG-HR` (Modify); `Everyone` убран.
+- Установлена роль **FS-Resource-Manager**, квота 100 МБ на `C:\Shares\Buh`.
+- Включены теневые копии на томе C: FS01 (хранилище 10%).
+- В `stand-log.md` добавлена запись о появлении FS01 и шар.
 
 ### Откат
 
-1. Выключить затронутые ВМ (не «Power Off» с потерей данных, а штатное завершение).
-2. VMware Workstation → правый клик по ВМ → **Snapshots → Snapshot Manager** → выбрать `before-l1-046` → **Go to**.
-3. Порядок: сначала FS01 (если откатываем всю лабу — можно просто удалить ВМ FS01 из инвентаря, она создана в этой главе), затем DC01, WIN11-CL01, WIN10-CL02, UBU01.
-4. Записать в `stand-log.md` строку вида: `2026-XX-XX откат к before-l1-046: FS01, шары, квоты, VSS, DFS — отменены`.
-5. Если FS01 удалён, на DC01 останется «мёртвый» объект компьютера — почистить: `Remove-ADComputer -Identity FS01` (и не забыть, что после повторной установки FS01 снова надо вводить в домен).
+1. На FS01: правый клик → **Snapshot** → **before-l1-046** → **Restore**. FS01 вернётся к состоянию «до ввода в домен».
+2. На DC01: **Snapshot** → **before-l1-046** → **Restore** (уберёт возможные изменения в группах).
+3. На WIN11-CL01 и WIN10-CL02: **Snapshot** → **before-l1-046** → **Restore** (уберёт подключённые диски Z:, Y: и сохранённые учётки).
+4. Удалить ВМ FS01 из инвентаря VMware (правый клик → **Remove from disk**), если хотим откатить полностью.
+5. В `stand-log.md` дописать строку «откат к before-l1-046, FS01 удалена».
 
 ## 6. Ошибки новичков и безопасность
 
-1. **«Дам Everyone Full Control — и пусть работает».** → Любой сотрудник, включая стажёра и уборщицу с доменной учёткой, читает зарплатную ведомость и может удалить бухгалтерские файлы. → Правильно: права только через группы AD (`GG-Buh`, `GG-HR`), а не на конкретных людей.
-2. **Путать шару и NTFS.** → «Я же дал доступ на шаре, почему не работает?» → Итог = самое строгое из двух. Диагностика всегда идёт по двум уровням: `Get-SmbShareAccess` и `icacls`/`Get-Acl`.
-3. **Менять права на корень `C:\` или на всю шару вместо одной папки.** → Наследование растаскивает широкие права по всему серверу, потом невозможно понять, кто откуда взялся. → Отключать наследование (`/inheritance:r`) и назначать ACE точечно.
-4. **«Я добавил его в группу, а он всё равно не входит».** → Токен доступа пользователя формируется при входе; членство в группе подхватится после перелогина. → Проверять `whoami /groups` и просить перезайти (или `klist purge`, если дело в Kerberos-тикете).
-5. **Считать теневые копии резервной копией.** → Умер диск/словили шифровальщик — снапшоты на том же томе умирают вместе с данными. → VSS это «откат случайной перезаписи за сутки», бэкап — отдельная история (урок 48).
-6. **Жёсткая квота без предупреждения.** → Пользователь посреди работы получает «Диск переполнен» и теряет несохранённое. → Soft limit + уведомления, либо порог с запасом.
-7. **Удалять «лишние» шары, не проверив, кто ими пользуется.** → Оборванная работа у целого отдела и заявка «всё пропало». → Сначала `Get-SmbSession` и `Get-SmbOpenFile`, потом решение.
-8. **Не включать ABE.** → Пользователи видят папки, к которым нет доступа, и заваливают первую линию заявками «а почему мне нельзя?». → `Set-SmbShare -FolderEnumerationMode AccessBased`.
+1. **Ошибка:** дать на шару `Everyone: Full Control`, «чтобы точно работало».
+   **К чему приводит:** любой, кто попал в сеть, читает и удаляет файлы бухгалтерии. В реальной компании — инцидент ИБ.
+   **Как правильно:** на шаре — только доменные группы (`GG-Buh`, `GG-HR`), `Everyone` не использовать. Итоговое право всё равно ограничится NTFS.
+
+2. **Ошибка:** путать права на шару и NTFS.
+   **К чему приводит:** «я же дал полный доступ, почему не пишет?» — потому что на NTFS только `Read`.
+   **Как правильно:** проверять оба уровня: `Get-SmbShareAccess` и `icacls`.
+
+3. **Ошибка:** после добавления в группу не попросить пользователя перелогиниться.
+   **К чему приводит:** «вы же сказали, что починили, а всё равно не работает» — токен входа старый.
+   **Как правильно:** всегда просить выйти/войти или делать `klist purge` (если есть права).
+
+4. **Ошибка:** лечить «нет доступа» перезагрузкой сервера.
+   **К чему приводит:** обрыв работы всего офиса на 10 минут, а причина была в одном пользователе.
+   **Как правильно:** сначала `Test-NetConnection -Port 445`, `Resolve-DnsName`, `Get-SmbShareAccess`, `icacls`, `Get-ADGroupMember` — и только потом думать про сервер.
+
+5. **Ошибка:** включать теневые копии без ограничения размера.
+   **К чему приводит:** тома забиваются снимками, сервер падает по месту.
+   **Как правильно:** `vssadmin add shadowstorage /maxsize=10%` (или разумный процент) и мониторинг.
+
+6. **Ошибка:** настраивать квоту на весь том вместо папки.
+   **К чему приводит:** «диск заполнен» у всех, включая системные службы.
+   **Как правильно:** квота на конкретную папку (`C:\Shares\Buh`), а не на `C:\`.
+
+7. **Ошибка:** использовать `net use` с сохранённым паролем старого пользователя.
+   **К чему приводит:** «у меня доступ к чужой папке» или «не пускает под моей учёткой».
+   **Как правильно:** `cmdkey /list` → `cmdkey /delete:FS01` → подключить заново.
+
+8. **Ошибка:** давать пользователю права администратора на FS01, «чтобы он сам разобрался».
+   **К чему приводит:** пользователь может удалить шары, поменять права, сломать сервер.
+   **Как правильно:** пользователь — только в доменной группе, права на шару — через группу.
 
 ### Безопасность
 
-- **SMB 1.0 держать выключенным.** В Windows Server 2022 и Windows 11 он отключён по умолчанию; включать ради старого сканера — значит открыть себе EternalBlue. Проверка: `Get-SmbServerConfiguration | Select EnableSMB1Protocol`.
-- **Порт 445 не выставлять в интернет.** Никогда и ни при каких условиях — только внутрь, через VPN. Это классический вектор атак (WannaCry, эксплойты SMB).
-- **SMB Signing и шифрование для чувствительных шар.** `Set-SmbShare -Name Buh -EncryptData $true` включает шифрование SMB 3.x на уровне шары; в боевой среде это стандарт для бухгалтерии и HR.
-- **Учебный пароль `Lab#2026-vektor` — только для стенда.** В реальной работе: разные пароли, ротация, запрет переиспользования, отдельные сервисные учётки.
-- **Права админа не «на всякий случай».** Не выдавай `GG-IT` Full Control на бухгалтерские папки, если это не согласовано: доступ к чужим данным — это ещё и 152-ФЗ/персональные данные.
-- **Отключать файрвол на FS01 ради лабы нельзя «молча».** На стенде мы этого и не делаем; в боевой среде «выключил firewall, чтобы заработало» — это инцидент, а не решение.
+В боевой среде **нельзя**:
+- Открывать шару на `Everyone: Full` — это классическая уязвимость, её находят сканеры и пентестеры.
+- Давать пользователю локального админа на файловом сервере.
+- Отключать брандмауэр на FS01 «чтобы проверить» — открывается SMB наружу, а это вектор атак (WannaCry и подобное).
+- Хранить на шаре файлы с паролями, ключами, персональными данными без шифрования и без ограничения доступа — это нарушение 152-ФЗ (тема урока 67).
+- Включать SMBv1 — устаревший протокол с известными дырами.
+
+На стенде мы используем учебный пароль `Lab#2026-vektor` и упрощённые настройки — в реальной компании так нельзя.
 
 ## 7. Вопросы на собеседовании
 
-**1. Пользователь пишет: «Не открывается сетевая папка, отказано в доступе». Как будешь разбираться?**
-Ответ: сначала отделяю сеть от прав — `ping`/`Test-NetConnection -Port 445`. Если порт закрыт, иду в сеть и файрвол. Если открыт — смотрю на клиенте `net use`, под какой учёткой подключение, переподключаю. Дальше `whoami /groups` — есть ли нужная группа в токене (если группу только что добавили — нужен перелогин). Затем на сервере два уровня: права на шаре `Get-SmbShareAccess` и NTFS `icacls`/`Get-Acl`. Итоговые права — самые строгие из двух. Найдя причину, фиксирую в заявке.
-*Что хочет услышать:* структурный подход «сеть → аутентификация → шара → NTFS», а не «сразу полезу в права».
-*Красный флаг:* «проверю, что у пользователя есть доступ» без конкретики; «включу Everyone Full Control, чтобы точно заработало».
+**Вопрос 1. «Пользователь говорит, что не открывается сетевая папка. Ваши действия?»**
 
-**2. Чем права на шаре отличаются от NTFS-прав и что победит?**
-Ответ: права на шаре действуют только при доступе по сети и имеют три уровня (Read/Change/Full). NTFS действуют всегда — и локально, и по сети — и настраиваются гораздо точнее (наследование, Deny, отдельные атрибуты). При конфликте действует самое строгое ограничение. На практике шару открывают широко (Authenticated Users — Change), а разграничение делают в NTFS через группы AD: так права живут в одном месте.
-*Что хочет услышать:* «эффективные права = пересечение, самое строгое» и понимание, что Deny перебивает Allow.
-*Красный флаг:* «это одно и то же»; «побеждают права шары».
+*Ответ:* «Сначала уточняю, что именно он видит: ошибку "Отказано в доступе", "Не найден сетевой путь" или папка открывается, но пустая. Дальше по шагам: проверяю `Test-NetConnection -ComputerName FS01 -Port 445` — если порт закрыт, проблема в сети или файрволе; проверяю `Resolve-DnsName` — если имя не резолвится, проблема в DNS; проверяю `Get-SmbShareAccess` и `icacls` на сервере — если права не те; проверяю `Get-ADGroupMember` — если пользователя убрали из группы; проверяю `cmdkey /list` — если закэширована старая учётка. По результатам либо исправляю, либо эскалирую на L2 с уже собранной информацией.»
 
-**3. DFS Namespaces и DFS Replication — в чём разница?**
-Ответ: Namespace — это слой адресации, «ярлыки». Пользователь ходит по одному пути `\\corp.vektor.lab\Shares`, а физически данные лежат на разных серверах; переехал сервер — поменяли таргет, путь у людей не изменился. Replication — это синхронизация содержимого между серверами, чтобы данные были в двух местах. Namespace решает проблему «адреса», Replication — «доступности и географии». Часто используют вместе, но это независимые компоненты.
-*Что хочет услышать:* чёткое разделение «навигация» vs «копирование данных».
-*Красный флаг:* «DFS — это когда папки дублируются на двух серверах» (описал только репликацию).
+*Что хочет услышать интервьюер:* структурный подход, а не «перезагрузите компьютер». Знание, что права на шару и NTFS — разные вещи.
 
-**4. Теневые копии заменяют бэкап?**
-Ответ: нет. VSS хранит предыдущие версии изменённых блоков на том же томе — это быстрый откат случайной перезаписи или удаления файла пользователем, буквально за минуту, без обращения в бэкап. Но если умер диск, поймали шифровальщика или том повреждён — снапшоты умирают вместе с данными. Поэтому нужен отдельный бэкап по схеме 3-2-1 (это уже урок 48).
-*Что хочет услышать:* «VSS — удобство, бэкап — гарантия», плюс знание ограничений (64 снапшота, ~10% тома по умолчанию).
-*Красный флаг:* «да, теневые копии это и есть бэкап, мы ими пользуемся вместо Veeam».
+*Красный флаг:* «Сразу перезагружаю сервер» или «Даю Everyone Full Control, чтобы точно заработало».
 
-**5. Файл на шаре «занят другим пользователем», изменить нельзя. Что делать?**
-Ответ: на файловом сервере `Get-SmbOpenFile` — нахожу `Path`, вижу `ClientComputerName` и `ClientUserName`, затем `Close-SmbOpenFile -FileId <id> -Force`. Но перед этим обязательно предупреждаю владельца: если у него открыт документ с несохранёнными правками, он их потеряет. В идеале — сначала попросить пользователя закрыть файл самому, принудительное закрытие — когда ждать нельзя.
-*Что хочет услышать:* инструмент + человеческий шаг «предупредить пользователя».
-*Красный флаг:* «перезагружу файловый сервер» или «сразу закрою, ничего страшного».
+**Вопрос 2. «Чем отличаются права на общий ресурс от прав NTFS?»**
+
+*Ответ:* «Права на шару (Share permissions) действуют только при доступе по сети, у них три уровня: Read, Change, Full Control. Права NTFS действуют и локально, и по сети, у них больше гранулярность. Итоговое право — самое строгое из двух. Поэтому на шаре обычно ставят Full Control для доменной группы, а тонкую настройку делают на NTFS. Если на шаре Read, а на NTFS Full — пользователь всё равно только прочитает.»
+
+*Что хочет услышать интервьюер:* понимание, что это два уровня, и правило «самое строгое побеждает».
+
+*Красный флаг:* «Это одно и то же» или «Права на шару важнее».
+
+**Вопрос 3. «Что такое DFS и зачем он нужен?»**
+
+*Ответ:* «DFS — Distributed File System, надстройка над SMB. Позволяет собрать шары с разных серверов в одно пространство имён вида `\\corp.vektor.lab\Files\Buh`, чтобы пользователь видел один путь, а физически файлы лежали на разных серверах. Есть два компонента: DFS Namespaces (пространство имён) и DFS Replication (репликация между серверами). Для L1 важно: если пользователь называет путь через DFS, реальная папка может быть на другом сервере, и при диагностике надо смотреть, куда указывает ссылка.»
+
+*Что хочет услышать интервьюер:* что кандидат знает термин и понимает, что это надстройка, а не отдельный протокол.
+
+*Красный флаг:* «DFS — это протокол вместо SMB» или полное незнание термина.
+
+**Вопрос 4. «Пользователь удалил файл на сетевой папке. Можно ли восстановить?»**
+
+*Ответ:* «Если на сервере настроены теневые копии (VSS), пользователь может сам через свойства папки → "Предыдущие версии" открыть версию на час назад и восстановить файл. Я проверяю на сервере `vssadmin list shadows /for=C:` — есть ли свежие копии. Если копий нет, восстановление только из резервной копии (это уже L2/бэкап-админ). Поэтому важно, чтобы теневые копии были настроены по расписанию и с ограничением размера, иначе том забьётся.»
+
+*Что хочет услышать интервьюер:* знание VSS и понимание, что это не заменяет бэкап.
+
+*Красный флаг:* «Восстановлю из корзины» (на сетевой папке корзины нет) или «Это невозможно».
+
+**Вопрос 5. «Что такое квота и как её проверить?»**
+
+*Ответ:* «Квота — ограничение размера папки или тома через FSRM (File Server Resource Manager). Пользователь заполняет папку и получает "диск заполнен", хотя на сервере места полно. Проверяю на сервере `Get-FsrmQuota -Path C:\Shares\Buh` — вижу Size и Usage. Если Usage близко к Size — объясняю пользователю, что квота достигнута, и либо чистим папку, либо (через админа) увеличиваем квоту. Квоты бывают жёсткие (SoftLimit = False) и мягкие (только предупреждение).»
+
+*Что хочет услышать интервьюер:* знание FSRM и понимание, что «диск заполнен» не всегда про физический диск.
+
+*Красный флаг:* «Квота — это про почту» или «Не знаю, что это».
 
 ## 8. Источники (официальная документация)
 
-- **learn.microsoft.com** — раздел «Storage → File and Storage Services»: обзор SMB, «SMB security enhancements», «SMB sharing overview». Поиск: `SMB overview Windows Server`.
-- **learn.microsoft.com** — справочник PowerShell-модуля SmbShare: `Get-SmbShare`, `New-SmbShare`, `Grant-SmbShareAccess`, `Get-SmbOpenFile`. Поиск: `SmbShare module PowerShell reference`.
-- **learn.microsoft.com** — «DFS Namespaces overview» и «DFS Replication overview». Поиск: `DFS Namespaces overview`.
-- **learn.microsoft.com** — «File Server Resource Manager»: quotas, soft vs hard, quota templates. Поиск: `FSRM quota soft limit`.
-- **learn.microsoft.com** — «Shadow Copies of Shared Folders» / «Volume Shadow Copy Service». Поиск: `Shadow Copies previous versions overview`.
-- **learn.microsoft.com** — `icacls` command reference. Поиск: `icacls command reference`.
-- **learn.microsoft.com** — «Access-based enumeration». Поиск: `access-based enumeration Windows Server`.
-- **ubuntu.com / manpages.ubuntu.com** — man-страницы `mount.cifs` и `smbclient`. Поиск: `mount.cifs man page ubuntu`.
-- **samba.org** — документация по `smbclient`. Поиск: `smbclient documentation samba`.
+- **Microsoft Learn** (learn.microsoft.com), раздел **Windows Server → File and Storage Services → SMB Share**. Поиск: `SMB share PowerShell New-SmbShare`.
+- **Microsoft Learn**, раздел **File Server Resource Manager (FSRM)**. Поиск: `FSRM quota PowerShell Get-FsrmQuota`.
+- **Microsoft Learn**, раздел **Shadow Copies / Volume Shadow Copy Service (VSS)**. Поиск: `vssadmin list shadows shadow copies Windows Server`.
+- **Microsoft Learn**, раздел **DFS Namespaces and DFS Replication overview**. Поиск: `DFS Namespaces overview Windows Server`.
+- **Microsoft Learn**, раздел **NTFS permissions vs share permissions**. Поиск: `NTFS permissions vs share permissions Windows Server`.
+- **Microsoft Learn**, раздел **icacls command reference**. Поиск: `icacls Windows commands`.
+- **Microsoft Learn**, раздел **net use command**. Поиск: `net use command Windows`.
+- **Microsoft Learn**, раздел **cmdkey command**. Поиск: `cmdkey command Windows credentials`.
 
-[ПРОВЕРИТЬ] Точное расписание создания теневых копий по умолчанию и отображение занятого места по квоте в PowerShell зависят от версии/сборки — сверяйся с оснасткой на своём стенде.
+Все ссылки — на главный домен `learn.microsoft.com`; конкретные URL ищи по указанным поисковым фразам, чтобы не нарваться на устаревшую версию статьи.

@@ -2,122 +2,100 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-Заявка в Service Desk:
+Заявка в учебную очередь `C:\Support\Tickets`:
 
-> **Пользователь:** ivanov (Иван Иванов, бухгалтерия)
-> **ВМ:** ASTRA01 (10.10.10.31), терминал в бухгалтерии
-> **Что написал:** «Поставили на ASTRA01 новую бухгалтерскую программу. Раньше я заходил туда под локальной учёткой, а теперь нужно под доменной — иначе программа не открывает `\\FS01\Buh`. Сделайте, чтобы я входил своим обычным паролем от Windows и сразу видел общую папку.»
-> **Срочность:** средняя, до конца дня.
+> **Пользователь:** Иван Иванов (бухгалтерия), ВМ WIN11-CL01
+> **Что написал:** «Здравствуйте! Нам на бухгалтерию поставили новую машину с Astra Linux (ASTRA01, 10.10.10.31). Раньше на ней работал только локальный пользователь, а теперь надо, чтобы сотрудники заходили туда под своими доменными учётками, как на Windows. И чтобы пароль был тот же, что в домене. Сейчас при входе пишет "неверное имя пользователя или пароль". Помогите, пожалуйста, до конца недели — надо сдавать отчёт.»
+> **Срочность:** средняя
 
-В Москве Linux в корпоративной сети — это не экзотика: файловые серверы, 1С-серверы, веб-прокси, системы видеонаблюдения, терминалы в бухгалтерии, Astra Linux на рабочих местах по импортозамещению. И почти всегда возникает один и тот же вопрос: «а можно, чтобы на этой Linux-машине работали те же логины и пароли, что в Windows?» Потому что держать вторую базу пользователей — это двойная работа и вечные расхождения: уволили сотрудника в AD, а на Linux he остался.
+В Москве в 2026 году это уже не экзотика. Госсектор, банки, крупные корпорации по требованиям импортозамещения переводят часть рабочих мест на Astra Linux, РЕД ОС, ALT Linux. При этом домен Active Directory почти везде остаётся — на Windows Server. И у L1 возникает задача: «Linux-машина должна видеть доменных пользователей». Это не «поставить пакет и забыть»: нужно понимать, как Linux вообще узнаёт про пользователей, что такое SSSD, Winbind, realmd, Kerberos, LDAP, и почему одна и та же команда на Astra и на ALT может выглядеть по-разному.
 
-После этой главы ты должен уметь: объяснить, что происходит при вводе Linux в домен; проверить DNS и время (две причины 80% провалов); выполнить ввод через `realmd` и через Samba; проверить, что доменная учётка реально логинится; ограничить вход только нужными группами; и диагностировать «вчера работало, сегодня не пускает».
+После этой главы ты будешь уметь: объяснить, как Linux-машина входит в AD; выполнить ввод ASTRA01 в домен `corp.vektor.lab`; проверить, что доменный пользователь реально может войти; диагностировать типовые ошибки (время, DNS, Kerberos, права sudo) и грамотно ответить на собеседовании, почему это не «просто apt install».
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-Главное, что нужно понять: **в Linux нет «домена» как встроенного понятия**. Есть два места, куда операционная система смотрит, когда ей нужно ответить на вопрос «кто этот пользователь?» и «пускать ли его?».
+Linux по своей природе ничего не знает про Active Directory. AD — это набор служб Microsoft: Kerberos (аутентификация), LDAP (каталог), DNS (SRV-записи), SMB (файлы и политики). Чтобы Linux-машина «стала доменной», на ней должны работать несколько компонентов, которые умеют говорить с этими службами.
 
-- **NSS** (Name Service Switch) — отвечает на вопрос «кто это». Через него работают `getent`, `id`, `ls -l`, `ps -u`. Настройка — `/etc/nsswitch.conf`. Чтобы доменные пользователи появились в системе, туда добавляется источник `sss` (или `winbind`).
-- **PAM** (Pluggable Authentication Modules) — отвечает на вопрос «правильный ли пароль и что делать после входа» (создать домашний каталог, применить лимиты). Настройка — `/etc/pam.d/`. Именно сюда подключается проверка пароля через Kerberos.
-
-Дальше — кто эти источники наполняет:
+Схема (упрощённо):
 
 ```text
-   ЛОГИН (login, su, sshd, gdm)
-        |                \
-        | PAM             \ NSS  (getent, id, ls -l)
-        v                  v
-   +------------------------------------+
-   |  SSSD  (демон sssd)                |   кэш пользователей и групп,
-   |  nss + pam + домены                |   оффлайн-вход
-   +------------------------------------+
-        |  Kerberos 88 (билеты)   |  LDAP 389/636 (атрибуты, группы)
-        |  DNS 53 (SRV-записи)    |  SMB 445 (смена пароля, GPO)
-        v                         v
-   +--------------------------------------------+
-   |  DC01  10.10.10.10  corp.vektor.lab        |
-   |  KDC (Kerberos) + LDAP + DNS + SYSVOL      |
-   |  объект компьютера UBU01 в AD              |
-   +--------------------------------------------+
-        ^
-        |  одноразовая операция «ввод в домен»:
-        |  realmd + adcli  ИЛИ  samba (net ads join)
-        |  результат: /etc/krb5.keytab + запись в AD
+   ASTRA01 (10.10.10.31)                    DC01 (10.10.10.10)
+   ┌──────────────────────┐                 ┌──────────────────────┐
+   │  login / ssh / sudo  │                 │  AD DS               │
+   │        │             │                 │  ├─ Kerberos (88)    │
+   │        ▼             │   DNS (53)      │  ├─ LDAP   (389/636) │
+   │  NSS  +  PAM         │◄───────────────►│  ├─ DNS    (53)      │
+   │        │             │   Kerberos(88)  │  └─ SMB    (445)     │
+   │        ▼             │   LDAP (389)    │                      │
+   │  SSSD (или winbind)  │                 │  зона corp.vektor.lab│
+   │        │             │                 │  (AD-интегрированная)│
+   │        ▼             │                 └──────────────────────┘
+   │  /etc/sssd/sssd.conf │
+   │  /etc/krb5.conf      │
+   │  /etc/nsswitch.conf  │
+   └──────────────────────┘
 ```
 
-Роли инструментов:
+Что здесь что:
 
-| Инструмент | Что делает | Где живёт |
-|---|---|---|
-| `realmd` | «мастер настройки»: находит домен, ставит нужные пакеты, вызывает join | Ubuntu, Debian, РЕД ОС [ПРОВЕРИТЬ], Astra [ПРОВЕРИТЬ] |
-| `adcli` | реально создаёт объект компьютера в AD и получает keytab | Debian/Ubuntu |
-| `SSSD` | постоянная работа: логин, группы, кэш, оффлайн | везде |
-| `winbind` + `net ads join` | альтернатива из мира Samba: то же самое, но «руками» | Samba, Astra (`astra-winbind`), ALT |
-| `FreeIPA` | **не** AD, а отдельный каталог (389-ds + Kerberos + CA) | RHEL-семейство, отдельный сервер |
-| ALD Pro / РЕД ИДМ | российские аналоги FreeIPA | Astra / РЕД ОС [ПРОВЕРИТЬ] |
+- **NSS (Name Service Switch)** — механизм, через который Linux отвечает на вопросы «кто такой ivanov?», «какая у него группа?». Файл `/etc/nsswitch.conf`. Чтобы доменные пользователи «появились» в системе, в строки `passwd`, `group`, `shadow` нужно добавить источник `sss` (SSSD) или `winbind`.
+- **PAM (Pluggable Authentication Modules)** — механизм проверки пароля при входе, `su`, `sudo`, `ssh`. Файлы в `/etc/pam.d/`. Чтобы доменный пароль проверялся через Kerberos, в PAM добавляют модуль `pam_sss.so`.
+- **Kerberos** — протокол аутентификации по билетам (ticket). Клиент получает у контроллера домена билет TGT (Ticket Granting Ticket), потом предъявляет его службам. Порт 88 TCP/UDP. Критично: **время на клиенте и на DC должно расходиться не более чем на 5 минут** (по умолчанию), иначе билет не выдаётся.
+- **LDAP** — протокол чтения каталога (пользователи, группы, OU). Порт 389 (или 636 для LDAPS). Через LDAP Linux узнаёт список пользователей и их группы.
+- **DNS** — Linux должен резолвить SRV-записи вида `_ldap._tcp.corp.vektor.lab`, `_kerberos._tcp.corp.vektor.lab`. Если DNS-сервер на клиенте не указывает на DC01 (10.10.10.10), ввод в домен провалится с ошибкой «Cannot resolve KDC» или «SRV record not found».
+- **SSSD (System Security Services Daemon)** — современный «клей»: одна служба, которая объединяет Kerberos + LDAP + кэш и отдаёт результат в NSS и PAM. Сегодня это стандарт для Linux в AD.
+- **Winbind** — старый компонент Samba, делает то же самое через SMB/RPC. Ещё встречается на старых дистрибутивах и в некоторых сборках ALT/РЕД ОС.
+- **realmd** — утилита-обёртка, которая автоматически настраивает SSSD/Winbind и Kerberos. Команда `realm join` — самый быстрый способ ввести машину в домен.
+- **Samba (как клиент домена)** — набор утилит `net ads join`, `wbinfo`, `smbclient`. Используется, когда нужен доступ к SMB-ресурсам (`\\FS01\Buh`) или когда realmd/SSSD недоступны.
+- **FreeIPA** — это **не** Active Directory. Это отдельный продукт (Red Hat), свой LDAP + Kerberos + DNS + CA. В нашей компании домен — AD, поэтому FreeIPA здесь только для сравнения: в задачах L1 «ввести Linux в AD» FreeIPA не используется, это отдельный сервер идентичности. Если компания выбрала FreeIPA — это архитектурное решение, а не задача L1.
 
-**FreeIPA — это не «ввод в AD».** FreeIPA строит свой собственный домен (`IPA.VEKTOR.LAB`), со своим Kerberos и своими пользователями. Доверие между FreeIPA и AD (`ipa trust-add`) — задача уровня L2+. На L1 достаточно знать разницу: «ввести Linux в существующий AD» ≠ «развернуть FreeIPA».
-
-**Порты**, которые нужны от Linux-клиента до DC01:
-
-| Порт | Протокол | Зачем |
-|---|---|---|
-| 53 TCP/UDP | DNS | найти DC по SRV-записям `_ldap._tcp`, `_kerberos._tcp` |
-| 88 TCP/UDP | Kerberos | получить билет (ticket) на вход |
-| 464 TCP/UDP | kpasswd | смена пароля |
-| 389 / 636 | LDAP | читать пользователей, группы, OU |
-| 3268 / 3269 | Global Catalog | поиск в масштабе леса |
-| 445 TCP | SMB | SYSVOL, GPO, смена пароля через AD |
-| 123 UDP | NTP | синхронизация времени (критично для Kerberos) |
-
-**Kerberos в двух словах:** пароль пользователя никогда не идёт по сети. Клиент просит у KDC (это DC01) «билет» — зашифрованный блок, который доказывает: «этот пользователь действительно тот, за кого себя выдаёт». Билет живёт ограниченное время и содержит метку времени. Поэтому **если часы на Linux и на DC расходятся больше чем на 5 минут, вход не работает** — это самая частая поломка после DNS. У машины (не человека) тоже есть свой «билет» — машинный аккаунт, его ключ хранится в файле `/etc/krb5.keytab`. Этот файл — фактически пароль компьютера: кто его скопировал, тот может представляться этой машиной в домене.
+Итого: чтобы Linux «стал доменным», нужно (1) правильный DNS, (2) синхронное время, (3) Kerberos-конфиг, (4) SSSD или Winbind, (5) правки NSS и PAM, (6) учётная запись компьютера в AD. realmd делает шаги 3–6 за одну команду.
 
 ## 3. Аналогия из жизни
 
-Представь завод с бюро пропусков. В бюро (это **DC01 / AD**) лежит база сотрудников и список, кому куда можно. На входе стоит турникет с вахтёром (**KDC**): сотрудник показывает паспорт, вахтёр сверяет с базой и выдаёт бумажный пропуск на сегодня (**Kerberos-билет**).
+Представь большой бизнес-центр с единой пропускной системой (это AD). У каждого сотрудника — бейдж с фотографией и чипом (это доменная учётка). На входе стоит турникет с ридером (это Kerberos: он проверяет чип и выдаёт талон на посещение). Внутри здания есть справочная, где можно узнать, кто в каком отделе работает (это LDAP). Есть служба охраны, которая знает, кому куда можно (это группы AD).
 
-Теперь в цеху открыли новый участок (**Linux-машина**). У него свой отдельный турникет, и он ничего не знает про заводскую базу. Чтобы всё заработало, нужно: (1) поставить на участке вахтёра, который умеет звонить в бюро пропусков — это **SSSD**; (2) оформить сам участок как объект в бюро пропусков и выдать ему служебный пропуск — это **ввод в домен** и файл `keytab`; (3) наладить телефонную линию до бюро — это **DNS и сетевые порты**.
+Теперь ты открываешь новый офис в этом же бизнес-центре (это Linux-машина). Чтобы твои сотрудники могли войти по общему бейджу, тебе нужно: провести в офис кабель к той же пропускной системе (DNS на DC01), синхронизировать часы на турникете с главными часами здания (Kerberos-время), поставить у себя турникет и ридер (SSSD), подключить справочную (LDAP) и зарегистрировать сам офис в управляющей компании (учётная запись компьютера в AD). realmd — это «мастер подключения офиса к бизнес-центру за один звонок».
 
-**realmd** — это монтажник, который приходит один раз, делает всё по чек-листу и уходит. **Samba/winbind** — тот же результат, но собранный вручную из готовых деталей.
-
-Где аналогия ломается: у вахтёра на участке нет своих часов, он смотрит на заводские. Если часы на участке убежали на десять минут, вахтёр считает любой пропуск просроченным — и человек с правильным паспортом не проходит.
+Аналогия перестаёт работать в одном месте: в бизнес-центре офис либо подключён, либо нет, а в Linux можно «подключить» только аутентификацию, но забыть про домашнюю папку, sudo и группы — и пользователь войдёт, но работать не сможет.
 
 ## 4. Практика и команды
 
-**1. Проверка DNS — всегда первым делом.**
+Все команды — на ASTRA01 под `adm.student` (sudo), если не указано иное. На DC01 — в PowerShell от `adm.student`.
+
+**1. Проверить DNS и время до ввода в домен.** Это первое, что делает L1 при любой проблеме с доменом.
 
 ```bash
+# DNS должен указывать на DC01
 cat /etc/resolv.conf
-resolvectl status | grep -A3 "DNS Servers"
-dig +short SRV _ldap._tcp.corp.vektor.lab @10.10.10.10
-```
-
-Ожидаемый вывод последней команды: `0 100 389 dc01.corp.vektor.lab.` В `resolv.conf` должен быть `nameserver 10.10.10.10`. Если там 8.8.8.8 или адрес шлюза VMware — домен не найдётся вообще, и `realm discover` скажет «not found». Смотреть: есть ли SRV-запись и указывает ли она на DC01.
-
-**2. Время.**
-
-```bash
+# Проверить SRV-записи Kerberos и LDAP
+sudo apt install -y dnsutils    # если ещё нет
+dig +short SRV _kerberos._tcp.corp.vektor.lab
+dig +short SRV _ldap._tcp.corp.vektor.lab
+# Время
 timedatectl
 ```
 
-Смотреть строку `System clock synchronized: yes` и `NTP service: active`. Сравнить с DC01 (PowerShell на DC01):
+Смотрим: в `resolv.conf` — `nameserver 10.10.10.10`; `dig` возвращает строки вида `0 100 88 dc01.corp.vektor.lab.` (примерно); `timedatectl` показывает `System clock synchronized: yes` и часовой пояс `Europe/Moscow`. Если SRV-записей нет — либо DNS не тот, либо DC01 не отвечает.
 
-```powershell
-w32tm /stripchart /computer:10.10.10.30 /samples:3
-```
-
-В выводе `o:` — смещение (offset) в секундах. Больше ±5 минут — вход не заработает. Важно: сравнивается **UTC-время**, а не «часовой пояс на экране».
-
-**3. Поиск домена (discovery).**
+**2. Установить пакеты для ввода в домен.** На Astra Linux CE набор может отличаться от Ubuntu, но базовые пакеты те же.
 
 ```bash
 sudo apt update
-sudo apt install -y realmd sssd sssd-tools adcli krb5-user \
-    samba-common-bin oddjob oddjob-mkhomedir packagekit
+sudo apt install -y realmd sssd sssd-tools libnss-sss libpam-sss \
+                    adcli samba-common-bin oddjob oddjob-mkhomedir \
+                    packagekit krb5-user
+```
+
+`realmd` — утилита `realm`; `sssd` — служба; `adcli` — утилита для работы с AD; `oddjob-mkhomedir` — создаёт домашнюю папку при первом входе; `krb5-user` — клиент Kerberos и `kinit`/`klist`. На ALT/РЕД ОС имена пакетов могут отличаться [ПРОВЕРИТЬ в конкретной версии].
+
+**3. Найти домен и посмотреть, что видит realmd.**
+
+```bash
 realm discover corp.vektor.lab
 ```
 
-Типичный (сокращённый) вывод:
+Вывод примерно:
 
 ```text
 corp.vektor.lab
@@ -127,292 +105,347 @@ corp.vektor.lab
   configured: no
   server-software: active-directory
   client-software: sssd
-  required-package: sssd-tools
-  required-package: adcli
-  login-formats: %U
+  required-package: sssd
+  ...
 ```
 
-Смотреть: `server-software: active-directory` (значит, нашли именно AD, а не чужой Kerberos) и `configured: no` до ввода в домен.
+Если `server-software: active-directory` — realmd нашёл DC. Если пусто или ошибка — проблема в DNS.
 
-**4. Проверка Kerberos до ввода.**
+**4. Ввести машину в домен.**
 
 ```bash
-kinit adm.student@CORP.VEKTOR.LAB
+sudo realm join -U adm.student corp.vektor.lab
+```
+
+`-U adm.student` — от чьего имени выполнять (нужны права создать объект компьютера в AD; `adm.student` — доменный админ, у него есть). Пароль спросит интерактивно. Успех — тишина или строка `Successfully enrolled machine in realm`. Ошибки: `Couldn't find kerberos realm` (DNS), `Clock skew too great` (время), `Insufficient access` (нет прав в AD).
+
+**5. Проверить, что учётка компьютера появилась в AD.** На DC01:
+
+```powershell
+Get-ADComputer -Filter 'Name -like "ASTRA01*"' | Select Name, DistinguishedName
+```
+
+Должна появиться запись `ASTRA01` (имя может быть в верхнем регистре). Если её нет — join не прошёл, даже если команда не выдала ошибку.
+
+**6. Проверить Kerberos-билет доменного пользователя.**
+
+```bash
+kinit ivanov@CORP.VEKTOR.LAB
 klist
 ```
 
-`klist` покажет выданный билет `krbtgt/CORP.VEKTOR.LAB@CORP.VEKTOR.LAB`. Если `kinit` падает с `Clock skew too great` — проблема во времени, если `Cannot find KDC` — в DNS. После проверки: `kdestroy`.
+`kinit` запросит пароль `ivanov` и выдаст TGT. `klist` покажет строку с `krbtgt/CORP.VEKTOR.LAB@CORP.VEKTOR.LAB`. Если `kinit` падает с `Preauthentication failed` — неверный пароль; `Clock skew` — время; `Cannot contact any KDC` — DNS/сеть.
 
-**5. Ввод в домен через realmd.**
-
-```bash
-sudo realm join --user=adm.student corp.vektor.lab
-sudo realm list
-```
-
-`realm join` спросит пароль (`Lab#2026-vektor`), создаст объект компьютера в AD, положит ключи в `/etc/krb5.keytab` и сгенерирует `/etc/sssd/sssd.conf`. `configured: kerberos-member` в `realm list` = машина в домене. Полезный ключ: `--computer-ou="OU=Компьютеры,OU=Company,DC=corp,DC=vektor,DC=lab"` — чтобы объект попал в нужное OU, а не в контейнер `CN=Computers`.
-
-**6. Настройка SSSD.**
+**7. Проверить, что SSSD видит пользователя.**
 
 ```bash
-sudo nano /etc/sssd/sssd.conf
-```
-
-```ini
-[sssd]
-domains = corp.vektor.lab
-config_file_version = 2
-services = nss, pam
-
-[domain/corp.vektor.lab]
-ad_domain = corp.vektor.lab
-krb5_realm = CORP.VEKTOR.LAB
-realmd_tags = manages-system joined-with-adcli
-cache_credentials = True
-id_provider = ad
-krb5_store_password_if_offline = True
-default_shell = /bin/bash
-ldap_id_mapping = True
-use_fully_qualified_names = False
-fallback_homedir = /home/%u@%d
-access_provider = ad
-```
-
-`use_fully_qualified_names = False` — чтобы писать `ivanov`, а не `ivanov@corp.vektor.lab`. `ldap_id_mapping = True` — AD не хранит Linux-UID, SSSD вычисляет их сам из SID. `access_provider = ad` — фильтр «кому можно входить». После правки: `sudo chmod 600 /etc/sssd/sssd.conf && sudo systemctl restart sssd` (SSSD не запустится с правами шире 0600).
-
-**7. Ограничение входа по группам.**
-
-```bash
-sudo realm deny --all
-sudo realm permit --groups GG-Buh
-sudo realm permit --groups GG-IT
-```
-
-Теперь ivanov (GG-Buh) входит, а petrova (GG-HR) — нет. Это правильная модель: «разрешено только тем, кому надо», а не «пускаем весь домен» [ПРОВЕРИТЬ точное имя опции `--groups` в вашей версии realmd].
-
-**8. Проверка, что учётка видна системе.**
-
-```bash
-getent passwd ivanov
 id ivanov@corp.vektor.lab
-sssctl user-checks ivanov
+getent passwd ivanov@corp.vektor.lab
 ```
 
-`getent passwd` вернёт строку вида `ivanov:*:1234567:1234567:Иван Иванов:/home/ivanov@corp.vektor.lab:/bin/bash`. Пусто — значит NSS не подключён или SSSD не запустился.
+`id` покажет UID/GID и группы (примерно `uid=1234567(ivanov) gid=1234567(domain users) groups=...`). `getent passwd` — строку из NSS. Если пусто — SSSD не настроен или `nsswitch.conf` не содержит `sss`.
 
-**9. Состояние домена и кэша.**
+**8. Проверить вход доменного пользователя.**
 
 ```bash
-sssctl domain-status corp.vektor.lab
-sudo sssctl cache-expire -a
-sudo systemctl restart sssd
+su - ivanov@corp.vektor.lab
 ```
 
-`domain-status` показывает `Online status: Online` и активный сервер. Если `Offline` — проверяй сеть/DNS. `cache-expire` нужен, когда группу в AD поменяли, а Linux «не видит»: SSSD держит кэш.
+Спросит пароль, должен пустить в домашнюю папку `/home/corp.vektor.lab/ivanov` (или `/home/ivanov@corp.vektor.lab` — зависит от настроек SSSD [ПРОВЕРИТЬ на Astra]). Если пускает, но домашней папки нет — не установлен `oddjob-mkhomedir` или не включён в PAM.
 
-**10. Домашний каталог при первом входе.**
+**9. Разрешить доменным админам sudo (осторожно!).** По умолчанию доменный пользователь — обычный. Чтобы `adm.student` мог `sudo`, добавляют правило:
 
 ```bash
-sudo pam-auth-update --enable mkhomedir
-grep mkhomedir /etc/pam.d/common-session
+sudo visudo -f /etc/sudoers.d/domain-admins
 ```
 
-Альтернатива, если профиля нет в списке — добавить руками в `/etc/pam.d/common-session` строку:
-`session required pam_mkhomedir.so skel=/etc/skel umask=0077`.
+Содержимое:
 
-**11. Samba-путь (так делают на Astra Linux и ALT).**
+```text
+%domain\ admins@corp.vektor.lab ALL=(ALL) ALL
+```
+
+Это учебная настройка. В боевой среде так делать нельзя без согласования с ИБ — обычно sudo дают через группы AD и централизованно.
+
+**10. Выйти из домена (если что-то пошло не так).**
 
 ```bash
-sudo apt install -y samba winbind libnss-winbind libpam-winbind
-sudo nano /etc/samba/smb.conf
+sudo realm leave corp.vektor.lab
 ```
 
-```ini
-[global]
-   workgroup = VEKTOR
-   realm = CORP.VEKTOR.LAB
-   security = ads
-   idmap config * : backend = tdb
-   idmap config * : range = 3000-7999
-   idmap config VEKTOR : backend = rid
-   idmap config VEKTOR : range = 10000-99999
-   template shell = /bin/bash
-   template homedir = /home/%U
-   winbind use default domain = yes
-```
+Убирает конфиг SSSD/Kerberos и (по умолчанию) учётку компьютера из AD. Если нужно оставить учётку — `realm leave --remove` [ПРОВЕРИТЬ флаг в твоей версии].
+
+**11. Посмотреть логи SSSD при проблемах.**
 
 ```bash
-sudo net ads join -U adm.student
-sudo systemctl restart smbd winbind
-sudo net ads testjoin      # ожидаем: Join is OK
-sudo wbinfo -t             # ожидаем: checking the trust secret ... succeeded
-sudo wbinfo -u             # список доменных пользователей
+sudo journalctl -u sssd -n 100 --no-pager
+sudo tail -n 100 /var/log/sssd/sssd_corp.vektor.lab.log
 ```
 
-На Astra Linux Common Edition есть пакет `astra-winbind`, который делает часть этой настройки за тебя, и графический модуль в «Центре управления системой» → раздел аутентификации/домена [ПРОВЕРИТЬ название модуля в вашей версии]. На ALT Linux аналогичный путь — метапакет `task-auth-ad-sssd` и утилита `system-auth write ad ...` в `alterator-auth` [ПРОВЕРИТЬ]. В РЕД ОС штатный пакетный менеджер — `dnf`, пакеты `realmd`/`sssd`/`adcli` [ПРОВЕРИТЬ наличие в репозитории] и модуль в «Центре управления».
+Ищем `Authentication failure`, `Cannot contact any KDC`, `SRV lookup failed`.
 
-**12. Проверка доступа к файловому ресурсу под доменной учёткой.**
+**12. Проверить, что машина «в домене» с точки зрения realmd.**
 
 ```bash
-smbclient -L //fs01.corp.vektor.lab -U 'ivanov@corp.vektor.lab'
-smbclient //fs01.corp.vektor.lab/Buh -U 'ivanov@corp.vektor.lab'
+realm list
 ```
 
-Внутри `smbclient` — `ls`, затем `exit`. Если пускает в `Obshchee`, но не в `Buh` — это права NTFS/шары на FS01 (тема урока 46), а не проблема ввода в домен.
+Вывод примерно:
+
+```text
+corp.vektor.lab
+  type: kerberos
+  realm-name: CORP.VEKTOR.LAB
+  domain-name: corp.vektor.lab
+  configured: kerberos-member
+  ...
+```
+
+`configured: kerberos-member` — машина в домене.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **DC01** (10.10.10.10): AD DS развёрнут (урок 42), есть OU `Company` → `Бухгалтерия`, `HR`, `Склад`, `IT`, `Компьютеры`, `Серверы`; пользователи `ivanov`, `petrova`, `sidorov`; группы `GG-Buh`, `GG-HR`, `GG-Sklad`, `GG-IT`; учётка `adm.student` — администратор домена.
-- **UBU01** (10.10.10.30, Ubuntu Server 24.04) — доступ по SSH/консоли, есть sudo.
-- **ASTRA01** (10.10.10.31, Astra Linux Common Edition) — доступ по консоли.
-- **FS01** (10.10.10.20) с шарой `\\FS01\Buh` — понадобится только на шаге 10.
-- Обе Linux-машины имеют выход в сеть VMnet8; DC01 — единственный DNS.
-- Если FS01 ещё не поднят, пройди уроки 46–47, шаг 10 можно пропустить.
+- DC01 (10.10.10.10) — Windows Server 2022, домен `corp.vektor.lab` развёрнут (L1 №42), OU и пользователи `ivanov`, `petrova`, `sidorov`, `adm.student` созданы (L1 №43), DNS-зона AD-интегрированная, DC01 — DNS-сервер для клиентов.
+- ASTRA01 (10.10.10.31) — Astra Linux CE, SSH включён, sudo-пользователь `adm.student`, статический адрес, DNS указывает на 10.10.10.10 (по хронологии L1 №30 и настройкам сети).
+- WIN11-CL01 и WIN10-CL02 — в домене (L1 №44), для проверки, что домен жив, но в лабораторной не участвуют.
+- Пароль стенда: `Lab#2026-vektor`.
 
 ### Снапшот
 
-В VMware Workstation на **DC01, UBU01 и ASTRA01**: меню `VM` → `Snapshot` → `Take Snapshot…`, имя — `before-l1-050`. (Или `VM` → `Snapshot Manager` → `Take`.) Снапшот контроллера домена в лабе допустим, потому что DC один и реплик нет; в боевой среде откат снапшота DC — плохая практика (USN rollback).
+В VMware Workstation на ASTRA01 и DC01: `before-l1-050`. На DC01 — обязательно, потому что join создаёт объект компьютера в AD.
 
 ### Шаги
 
-1. **UBU01.** Проверь адрес и DNS: `ip -br a`, `resolvectl status`. Ожидаем: адрес из пула 10.10.10.100–150, в DNS-серверах — `10.10.10.10`. Если не так — поправь `/etc/netplan/*.yaml` (`nameservers: addresses: [10.10.10.10]`), затем `sudo netplan apply`.
-2. **UBU01.** `dig +short SRV _ldap._tcp.corp.vektor.lab @10.10.10.10` → одна строка `0 100 389 dc01.corp.vektor.lab.`
-3. **UBU01 + DC01.** Сверь время: `timedatectl` на UBU01, `w32tm /query /status` и `w32tm /stripchart /computer:10.10.10.30 /samples:3` на DC01. Ожидаем: `System clock synchronized: yes`, смещение — секунды.
-4. **UBU01.** Установи пакеты (команда из п.4.3) и выполни `realm discover corp.vektor.lab`. Ожидаем `server-software: active-directory`, `configured: no`.
-5. **UBU01.** `kinit adm.student@CORP.VEKTOR.LAB` (пароль `Lab#2026-vektor`), затем `klist`. Ожидаем билет `krbtgt/CORP.VEKTOR.LAB@CORP.VEKTOR.LAB`. Выполни `kdestroy`.
-6. **UBU01.** `sudo realm join --user=adm.student corp.vektor.lab`. Ожидаем: запрос пароля, затем тишину и код возврата 0 (`echo $?`). Проверь: `realm list` → `configured: kerberos-member`, `login-formats: %U`.
-7. **DC01.** В PowerShell: `Get-ADComputer -Filter "Name -like 'UBU*'" | Select-Object Name, DistinguishedName, Enabled`. Ожидаем: `UBU01` в `CN=Computers,DC=corp,DC=vektor,DC=lab`, `Enabled: True`.
-8. **UBU01.** Приведи `/etc/sssd/sssd.conf` к виду из п.4.6, `sudo chmod 600 /etc/sssd/sssd.conf`, `sudo systemctl restart sssd`, `systemctl status sssd` → `active (running)`.
-9. **UBU01.** `sudo realm deny --all`, затем `sudo realm permit --groups GG-Buh` и `--groups GG-IT`. Включи создание домашних каталогов (п.4.10).
-10. **UBU01.** Проверки: `id ivanov@corp.vektor.lab` → группа `gg-buh@corp.vektor.lab` в списке; `su - ivanov` (пароль `Lab#2026-vektor`) → приглашение шелла и путь `/home/ivanov@corp.vektor.lab`; `exit`. Затем `su - petrova` → ожидаем отказ (не в разрешённых группах). Под ivanov: `smbclient //fs01.corp.vektor.lab/Buh -U 'ivanov@corp.vektor.lab'` → `ls` показывает файлы, `exit`.
-11. **ASTRA01.** Ввод через Samba: `sudo apt install -y astra-winbind` (или набор пакетов из п.4.11) [ПРОВЕРИТЬ состав пакета в вашей версии], правка `/etc/samba/smb.conf` по образцу, `sudo net ads join -U adm.student`, `sudo systemctl restart smbd winbind`, `sudo net ads testjoin` → `Join is OK`, `sudo wbinfo -t` → `succeeded`, `sudo wbinfo -u` → список доменных пользователей.
-12. **ASTRA01.** `getent passwd ivanov` и `sudo su - ivanov` → вход работает, домашний каталог создаётся (если нет — включи `pam_mkhomedir` по п.4.10). Запиши результат в `stand-log.md`.
+1. **На DC01** проверь, что домен и DNS живы. В PowerShell от `adm.student`:
+
+    ```powershell
+    Get-ADDomain | Select DNSRoot, NetBIOSName
+    Resolve-DnsName -Name _kerberos._tcp.corp.vektor.lab -Type SRV
+    ```
+
+    Ожидаемо: `DNSRoot corp.vektor.lab`, `NetBIOSName VEKTOR`, SRV-запись указывает на `dc01.corp.vektor.lab` порт 88.
+
+2. **На ASTRA01** проверь DNS и время:
+
+    ```bash
+    cat /etc/resolv.conf
+    timedatectl
+    ```
+
+    Ожидаемо: `nameserver 10.10.10.10`, `System clock synchronized: yes`, часовой пояс `Europe/Moscow`. Если время «плывёт» — синхронизируй (`sudo timedatectl set-ntp true` или вручную `sudo date -s "..."`).
+
+3. **На ASTRA01** проверь SRV-записи:
+
+    ```bash
+    sudo apt install -y dnsutils
+    dig +short SRV _kerberos._tcp.corp.vektor.lab
+    dig +short SRV _ldap._tcp.corp.vektor.lab
+    ```
+
+    Ожидаемо: строки с `dc01.corp.vektor.lab.` и портами 88 и 389. Если пусто — DNS не тот, дальше идти нет смысла.
+
+4. **На ASTRA01** установи пакеты:
+
+    ```bash
+    sudo apt update
+    sudo apt install -y realmd sssd sssd-tools libnss-sss libpam-sss \
+                        adcli samba-common-bin oddjob oddjob-mkhomedir \
+                        packagekit krb5-user
+    ```
+
+    Ожидаемо: пакеты установлены без ошибок. На Astra CE имена могут отличаться [ПРОВЕРИТЬ].
+
+5. **На ASTRA01** найди домен:
+
+    ```bash
+    realm discover corp.vektor.lab
+    ```
+
+    Ожидаемо: блок с `server-software: active-directory`, `client-software: sssd`, `configured: no`.
+
+6. **На ASTRA01** введи машину в домен:
+
+    ```bash
+    sudo realm join -U adm.student corp.vektor.lab
+    ```
+
+    Введи пароль `Lab#2026-vektor`. Ожидаемо: `Successfully enrolled machine in realm` или тишина. Если ошибка — смотри шаг 11.
+
+7. **На DC01** проверь, что учётка компьютера появилась:
+
+    ```powershell
+    Get-ADComputer -Filter 'Name -like "ASTRA01*"' | Select Name, DistinguishedName
+    ```
+
+    Ожидаемо: одна запись `ASTRA01` (или `ASTRA01$` в некоторых отображениях). Если её нет — join не прошёл.
+
+8. **На ASTRA01** проверь Kerberos и SSSD:
+
+    ```bash
+    kinit ivanov@CORP.VEKTOR.LAB
+    klist
+    id ivanov@corp.vektor.lab
+    ```
+
+    Ожидаемо: `kinit` спрашивает пароль `ivanov` (`Lab#2026-vektor`), `klist` показывает TGT, `id` — UID/GID и группы, включая `domain users` и `GG-Buh` (если `ivanov` в этой группе по L1 №43).
+
+9. **На ASTRA01** проверь вход доменного пользователя:
+
+    ```bash
+    su - ivanov@corp.vektor.lab
+    pwd
+    exit
+    ```
+
+    Ожидаемо: пускает, `pwd` показывает домашнюю папку (`/home/corp.vektor.lab/ivanov` или похожую [ПРОВЕРИТЬ]). Если папки нет — `oddjob-mkhomedir` не включён в PAM.
+
+10. **На ASTRA01** проверь `realm list`:
+
+    ```bash
+    realm list
+    ```
+
+    Ожидаемо: `configured: kerberos-member`.
+
+11. **Если join упал** — посмотри логи:
+
+    ```bash
+    sudo journalctl -u sssd -n 100 --no-pager
+    sudo tail -n 100 /var/log/sssd/sssd_corp.vektor.lab.log
+    ```
+
+    Типовые строки: `Clock skew too great` (время), `Cannot contact any KDC` (DNS/сеть), `Preauthentication failed` (пароль), `Insufficient access` (права в AD).
+
+12. **Запиши в журнал** `C:\Lab\vektor\stand-log.md`: «ASTRA01 введена в домен corp.vektor.lab, учётка компьютера создана, доменный вход ivanov проверен».
 
 ### Проверка
 
-- [ ] `dig +short SRV _ldap._tcp.corp.vektor.lab @10.10.10.10` возвращает запись DC01
-- [ ] `realm list` на UBU01: `configured: kerberos-member`, `login-formats: %U`
-- [ ] `/etc/krb5.keytab` существует, права `600 root:root`
-- [ ] `getent passwd ivanov` возвращает строку с `/bin/bash`
-- [ ] `su - ivanov` на UBU01 проходит с паролем `Lab#2026-vektor`
-- [ ] `su - petrova` на UBU01 отклоняется (ограничение по группам)
-- [ ] В AD есть объект компьютера `UBU01`, в свойствах `OperatingSystem` = Ubuntu [ПРОВЕРИТЬ, заполняет ли adcli это поле]
-- [ ] На ASTRA01 `net ads testjoin` → `Join is OK`
-- [ ] ivanov открывает `\\FS01\Buh` с Linux-машины
-- [ ] Все изменения записаны в `stand-log.md`
+- [ ] `realm discover corp.vektor.lab` показывает `server-software: active-directory`.
+- [ ] `realm list` показывает `configured: kerberos-member`.
+- [ ] На DC01 `Get-ADComputer` находит `ASTRA01`.
+- [ ] `kinit ivanov@CORP.VEKTOR.LAB` и `klist` дают TGT.
+- [ ] `id ivanov@corp.vektor.lab` показывает UID и группы.
+- [ ] `su - ivanov@corp.vektor.lab` пускает в домашнюю папку.
+- [ ] В `stand-log.md` есть запись об изменении.
 
 ### Сломай и почини
 
-> **Пользователь:** ivanov (бухгалтерия)
-> **ВМ:** UBU01
-> **Что написал:** «Утром не могу зайти на терминал под своим доменным паролем. Пишет `Authentication failure`, пароль точно правильный — в Windows на WIN11-CL01 он работает.»
-> **Срочность:** высокая, работа стоит.
+**Заявка:**
 
-**Как воспроизвести поломку.** На UBU01 от имени root:
+> **Пользователь:** Иван Иванов (бухгалтерия), ВМ ASTRA01
+> **Что написал:** «После обеда перестал пускать на ASTRA01 под доменной учёткой. Пишет "Authentication failure". Пароль точно правильный — на Windows (WIN11-CL01) вхожу. Срочно, отчёт!»
+> **Срочность:** высокая
+
+**Как воспроизвести поломку.** На ASTRA01 (под `adm.student`) сдвинь системное время на 10 минут вперёд:
 
 ```bash
 sudo timedatectl set-ntp false
-sudo date -s "+11 minutes"
-sudo systemctl restart sssd
+sudo date -s "+10 minutes"
 ```
 
-Теперь `su - ivanov` падает, хотя пароль верный.
+После этого `kinit ivanov@CORP.VEKTOR.LAB` начнёт падать с `Clock skew too great` — Kerberos не выдаст билет, SSSD не пустит пользователя. Это ровно то, что видит пользователь.
 
-**Диагностика по шагам (именно в этом порядке):**
+**Диагностика по шагам:**
 
-1. Повторить проблему и посмотреть точный текст: `su - ivanov`. Часто там прямо написано `Authentication failure`.
-2. Проверить, жив ли SSSD: `systemctl status sssd` → `active (running)`. Упавший демон сразу объясняет всё.
-3. Проверить домен: `sssctl domain-status corp.vektor.lab`. `Online` — сеть и DNS живы, проблема не в них.
-4. **Проверить время** — `timedatectl`. Если `NTP service: inactive` и время «уехало», это оно. Сверить с DC01: `w32tm /stripchart /computer:10.10.10.30 /samples:3` — смещение в сотни секунд.
-5. Посмотреть лог SSSD: `sudo tail -n 50 /var/log/sssd/sssd_corp.vektor.lab.log` — ищем `Clock skew too great` / `KRB5KRB_AP_ERR_SKEW`. Это подтверждает диагноз.
-6. На всякий случай исключить вторую частую причину — удалённый/отключённый объект компьютера: на DC01 `Get-ADComputer UBU01 | Select Enabled`. Если `False` — учётку включить (`Enable-ADAccount`) и перезайти.
-7. Проверить, что вход режет не группа: `sssctl user-checks ivanov` — если access provider даёт `denied`, дело в `realm permit`, а не во времени.
+1. На ASTRA01: `timedatectl` — видим, что время ушло вперёд на 10 минут относительно реального.
+2. Сравни с DC01: на DC01 в PowerShell `Get-Date` — время правильное.
+3. Проверь `kinit ivanov@CORP.VEKTOR.LAB` — ошибка `Clock skew too great` подтверждает диагноз.
+4. Проверь `journalctl -u sssd -n 50` — там будут строки про Kerberos preauthentication / clock skew.
 
-**Решение.**
+**Решение:**
 
 ```bash
 sudo timedatectl set-ntp true
-sudo systemctl restart systemd-timesyncd
-timedatectl            # ждём System clock synchronized: yes
+# если NTP недоступен — вручную:
+sudo date -s "2026-01-15 14:30:00"   # подставь реальное время
 sudo systemctl restart sssd
-su - ivanov            # проверка
 ```
 
-**Ответ пользователю:** «Иван, добрый день. Причина — рассинхронизация времени на терминале после ночного обслуживания: контроллер домена отклонял вход из-за разницы часов. Время синхронизировал, вход под доменной учёткой проверил — работает. Если повторится, сразу пишите: это одна минута на исправление».
+После этого `kinit` и `su -` работают.
 
-**Закрытие заявки:** категория «Аутентификация / домен», в решении — «восстановлена синхронизация времени (NTP), SSSD перезапущен, вход проверен», привязка к конфигурационной единице UBU01.
+**Ответ пользователю:** «Иван, добрый день. Причина — рассинхронизация времени на ASTRA01 с контроллером домена: Kerberos не выдаёт билет, если разница больше 5 минут. Время синхронизировал, вход под доменной учёткой восстановлен. Проверьте, пожалуйста, и напишите, если ещё что-то не так.»
+
+**Закрытие заявки:** категория «Аутентификация / AD», решение «синхронизация времени на Linux-клиенте», примечание «проверить, почему NTP отключился — возможно, ручное вмешательство или сбой chrony/systemd-timesyncd».
 
 ### Что изменилось на стенде
 
-- **UBU01**: введён в домен `corp.vektor.lab`; установлены `realmd`, `sssd`, `sssd-tools`, `adcli`, `krb5-user`, `samba-common-bin`, `oddjob`, `oddjob-mkhomedir`, `packagekit`; создан `/etc/krb5.keytab`; настроен `/etc/sssd/sssd.conf` (`use_fully_qualified_names = False`, `fallback_homedir = /home/%u@%d`); вход разрешён группам `GG-Buh`, `GG-IT`; включён `pam_mkhomedir`.
-- **ASTRA01**: введён в домен через Samba/winbind (workgroup `VEKTOR`, realm `CORP.VEKTOR.LAB`, idmap rid 10000–99999), `winbind` работает, доменные пользователи видны через `getent`.
-- **DC01 (AD)**: появились объекты компьютеров `UBU01` и `ASTRA01` (по умолчанию `CN=Computers`).
-- **Проверено**: ivanov входит на UBU01 и открывает `\\FS01\Buh`; petrova на UBU01 не входит.
-- Учебная особенность: пароль доменного администратора вводился вручную в консоли лабы; в боевой среде так не делают (см. раздел 6).
+- ASTRA01 введена в домен `corp.vektor.lab`, в AD создана учётная запись компьютера `ASTRA01`.
+- На ASTRA01 установлены пакеты `realmd`, `sssd`, `adcli`, `krb5-user`, `oddjob-mkhomedir` и др.
+- На ASTRA01 настроены `/etc/sssd/sssd.conf`, `/etc/krb5.conf`, `/etc/nsswitch.conf`, PAM.
+- Доменный пользователь `ivanov` может входить на ASTRA01.
+- В `C:\Lab\vektor\stand-log.md` добавлена запись.
 
 ### Откат
 
-1. На UBU01 и ASTRA01 (если хочешь чистые машины): `sudo realm leave --user=adm.student corp.vektor.lab` или `sudo net ads leave -U adm.student`, затем в VMware `VM` → `Snapshot Manager` → выбрать `before-l1-050` → `Go To`.
-2. На DC01 откат снапшота уберёт и объекты компьютеров. Если DC01 не откатываешь — удали объекты вручную: `Remove-ADComputer -Identity UBU01` (аналогично `ASTRA01`).
-3. После любого отката почисти кэш SSSD (`sudo sssctl cache-expire -a`), чтобы не остались «призрачные» пользователи, и обнови `stand-log.md`.
+1. На ASTRA01: `sudo realm leave corp.vektor.lab` (убирает конфиг и учётку компьютера).
+2. Если нужно чисто — восстанови снапшот `before-l1-050` на ASTRA01 и DC01 в VMware Workstation: правый клик по ВМ → Snapshot Manager → выбрать `before-l1-050` → Restore.
+3. Удали запись из `stand-log.md` или добавь строку «откат к before-l1-050».
 
 ## 6. Ошибки новичков и безопасность
 
-1. **Не проверили DNS → `realm discover` ничего не находит.** Классика: в `/etc/resolv.conf` остался DNS провайдера или шлюз VMware. → Всегда начинай с `dig SRV _ldap._tcp.corp.vektor.lab @10.10.10.10` и только потом вводи в домен.
-2. **Разное время → «Clock skew too great».** Проверяют пароли, группы, перезагружают — а дело в часах. → Перед вводом всегда `timedatectl` + сверка с DC01; в боевой среде NTP обязателен на всех серверах.
-3. **Ввод в домен под своей админской учёткой.** В лабе — `adm.student`, ок. В бою для этого заводят отдельную сервисную учётку с правом создавать объекты только в конкретном OU. → Не используй пароль доменного администратора в скриптах и не оставляй его в истории bash (`HISTIGNORE`, `history -c`).
-4. **Права на `/etc/sssd/sssd.conf` шире 0600.** SSSD просто не стартует с «подозрительным» файлом. → `sudo chmod 600 /etc/sssd/sssd.conf && sudo systemctl restart sssd`.
-5. **Забыли `use_fully_qualified_names = False`.** Все команды требуют `ivanov@corp.vektor.lab`, пользователь злится, скрипты падают. → Решить заранее и одинаково на всех машинах.
-6. **Пустой фильтр входа (`access_provider` без ограничений).** В систему может зайти любой доменный аккаунт, включая сервисные и админские. → `realm deny --all` + `realm permit --groups GG-...` или `simple_allow_groups`.
-7. **Кэш SSSD после смены групп.** Пользователя добавили в `GG-Buh`, а Linux «не видит» доступ. → `sudo sssctl cache-expire -a` и повторный вход; кэш — это фича (оффлайн-вход), но про него забывают.
-8. **Ручная правка `/etc/nsswitch.conf` и `/etc/pam.d/` без бэкапа.** Ломается локальный вход, и ты остаёшься без root на машине. → Держи вторую консоль root открытой, копируй файлы в `.bak`, проверяй `getent passwd` до перезагрузки.
+1. **Неверный DNS на клиенте.** Ошибка → `realm discover` не находит домен, `kinit` не находит KDC. Правильно: перед join всегда проверять `/etc/resolv.conf` и `dig SRV`.
+2. **Рассинхронизация времени.** Ошибка → `Clock skew too great`, пользователь не входит. Правильно: `timedatectl` до и после join, NTP включён.
+3. **`realm join` без прав в AD.** Ошибка → `Insufficient access`. Правильно: использовать учётку с правами создать объект компьютера (в учебном стенде — `adm.student`), в боевой — заранее согласованную сервисную учётку.
+4. **Забыть `oddjob-mkhomedir`.** Ошибка → пользователь входит, но без домашней папки, приложения падают. Правильно: ставить пакет и включать `pam_mkhomedir` в PAM.
+5. **Путать FreeIPA и AD.** Ошибка → пытаются «ввести в AD» через `ipa-client-install`, ничего не работает. Правильно: FreeIPA — отдельный продукт, для AD используют realmd/SSSD или Samba/winbind.
+6. **Дать доменному пользователю sudo «на всякий случай».** Ошибка → любой доменный пользователь — админ на Linux-машине. Правильно: только конкретная группа AD, только через `/etc/sudoers.d/`, согласовано с ИБ.
+7. **Не проверить вход после join.** Ошибка → «вроде в домене», а пользователь не входит. Правильно: всегда `kinit` + `id` + `su -` после join.
+8. **Игнорировать логи SSSD.** Ошибка → гадание вместо диагностики. Правильно: `journalctl -u sssd` и `/var/log/sssd/`.
 
-**Безопасность.** Файл `/etc/krb5.keytab` — это пароль машины: нельзя копировать его на другие хосты и хранить в git. Доменных пользователей не надо автоматически добавлять в `sudo` — вход в систему и административные права это разные вещи. Не открывай порты 88/389/445 с Linux-клиента наружу периметра. На Astra Linux в режиме защищённой ОС дополнительно работает мандатный контроль доступа — там ввод в домен и настройку прав согласовывают с ИБ, а не делают «по статье из интернета». В лабе мы, для простоты, один раз отключаем ограничения (`realm deny --all` → `permit` по группам) и работаем учебным паролем `Lab#2026-vektor` — в реальной компании такой пароль недопустим, а список разрешённых групп должен быть минимальным.
+### Безопасность
 
-## 7. Вопросы на собеседовании (3–5 вопросов с ответами)
+- В боевой среде нельзя вводить Linux-машину в домен под личной доменной админской учёткой — для этого выделяют сервисную учётку с минимальными правами (создание объектов компьютеров в конкретном OU).
+- Нельзя давать доменным пользователям sudo без согласования: это обход модели доступа AD.
+- Нельзя отключать SELinux/AppArmor и файрвол «чтобы заработало» — это маскирует настоящую причину (обычно DNS или порт).
+- Пароли стенда (`Lab#2026-vektor`) — только учебные. В реальной среде такие пароли недопустимы.
+- Логи SSSD и Kerberos могут содержать имена пользователей и служебную информацию — не выкладывай их в публичные чаты.
 
-**1. Как ввести Linux-машину в домен Active Directory? Какие компоненты участвуют?**
+## 7. Вопросы на собеседовании
 
-*Ответ:* Проверяю DNS (клиент должен использовать DC как DNS-сервер, иначе не найдутся SRV-записи) и синхронизацию времени. Устанавливаю `realmd`, `sssd`, `adcli`, `krb5-user`, `samba-common-bin`. Выполняю `realm discover corp.vektor.lab` — убеждаюсь, что найден именно AD, затем `realm join --user=<учётка> corp.vektor.lab`. Команда создаёт объект компьютера в AD и файл `/etc/krb5.keytab`, генерирует `/etc/sssd/sssd.conf`. Дальше правлю конфиг SSSD, включаю создание домашних каталогов через PAM, ограничиваю вход по группам и проверяю `getent passwd`, `id`, `su -`. Альтернативный путь — Samba/winbind: `net ads join`, `wbinfo -t`.
-*Что хочет услышать интервьюер:* порядок «DNS → время → discover → join → sssd.conf → проверка», понимание, что SSSD закрывает и NSS, и PAM.
-*Красный флаг:* «ставлю winbind, правлю smb.conf и всё» без диагностики DNS и времени; или «ставлю FreeIPA» как ответ на вопрос про ввод в существующий AD.
+**Вопрос 1. «Как ввести Linux-машину в Active Directory?»**
 
-**2. Пользователь не может войти на Linux-сервер под доменной учёткой. Ваши действия?**
+Ответ: «Есть два основных пути. Первый — через `realmd` и SSSD: `realm discover`, `realm join -U <учётка> <домен>`, потом проверка `realm list`, `kinit`, `id`, `su -`. Второй — через Samba/winbind: `net ads join -U <учётка>`, настройка `smb.conf`, `wbinfo -t`, `wbinfo -u`. Перед этим обязательно проверить DNS (SRV-записи Kerberos и LDAP должны резолвиться на DC) и синхронизацию времени — иначе Kerberos не выдаст билет. После join проверить, что учётка компьютера появилась в AD, и что доменный пользователь реально входит.»
 
-*Ответ:* Сначала точный текст ошибки и когда это началось. Дальше по цепочке: 1) `systemctl status sssd` — работает ли демон; 2) `sssctl domain-status corp.vektor.lab` — домен в сети или offline; 3) `timedatectl` и сверка с DC (`w32tm /stripchart`) — расхождение часов; 4) `getent passwd <user>` — видит ли система учётку; 5) `sssctl user-checks <user>` — не режет ли access provider или группы; 6) лог `/var/log/sssd/sssd_<домен>.log`; 7) на DC — включён ли объект компьютера и не заблокирована ли учётка. 8) Кэш: `sssctl cache-expire -a`.
-*Что хочет услышать интервьюер:* что ты идёшь по слоям (сервис → домен → время → права → AD), а не перезагружаешь наугад.
-*Красный флаг:* «переустановлю SSSD и заново введу в домен» без единой проверки; «почищу keytab».
+*Что хочет услышать интервьюер:* что ты знаешь про DNS, время, Kerberos и SSSD, а не только одну команду.
+*Красный флаг:* «просто ставлю пакет и всё работает» без упоминания DNS и времени.
 
-**3. Чем SSSD отличается от winbind и что выбрать?**
+**Вопрос 2. «Почему пользователь не может войти на Linux-машине, хотя в домене он есть и пароль верный?»**
 
-*Ответ:* Оба дают доменных пользователей через NSS и PAM. SSSD — отдельный демон с продуманным кэшем и оффлайн-входом, лучше работает с AD (GPO-фильтры, доверия), в связке с realmd/adcli это путь по умолчанию в Debian/Ubuntu и РЕД ОС. Winbind — часть Samba, часто безальтернативен там, где нужен именно Samba-стек (Astra Linux `astra-winbind`, ALT), и хорошо ложится на политику конкретного дистрибутива. В одном домене на одной машине держать оба нельзя.
-*Что хочет услышать интервьюер:* понимание, что это конкурирующие клиенты одного и того же, и выбор зависит от дистрибутива и требований, а не «что первое вспомнил».
-*Красный флаг:* «winbind — старьё, SSSD — новьё» без понимания, что на Astra/ALT штатно поддерживается winbind.
+Ответ: «Самые частые причины: рассинхронизация времени больше 5 минут (Kerberos не выдаёт билет), неверный DNS на клиенте (не резолвятся SRV-записи), SSSD не запущен или не настроен, `nsswitch.conf` не содержит `sss`, PAM не настроен. Диагностика: `timedatectl`, `dig SRV _kerberos._tcp.<домен>`, `kinit <user>@<REALM>`, `journalctl -u sssd`. По ошибке `kinit` обычно сразу понятно, в чём дело.»
 
-**4. Что такое keytab и почему к нему особое отношение?**
+*Что хочет услышать интервьюер:* системную диагностику, а не «перезагрузите».
+*Красный флаг:* «надо переустановить Linux».
 
-*Ответ:* `/etc/krb5.keytab` — набор ключей машинного аккаунта, по сути пароль компьютера для Kerberos. С ним машина получает билеты для служб (например, для SMB) без ввода пароля. Если файл утёк, злоумышленник может представляться этой машиной. Поэтому права минимум (0600 root:root), нельзя копировать на другие хосты и в репозитории, при компрометации — перевыпуск: переустановить машинный пароль (переввод в домен / `adcli update`).
-*Что хочет услышать интервьюер:* понимание, что keytab = секрет, а не «настройка».
-*Красный флаг:* «просто скопирую keytab на второй сервер, чтобы не вводить его в домен».
+**Вопрос 3. «Чем FreeIPA отличается от Active Directory и когда что используют?»**
 
-**5. Что нужно открыть на файрволе между Linux-клиентом и контроллером домена?**
+Ответ: «FreeIPA — это отдельный продукт на Linux (LDAP + Kerberos + DNS + CA), часто используется в чисто Linux-инфраструктуре. AD — это Microsoft-домен, стандарт в корпоративной среде с Windows. Если компания уже на AD, Linux-машины вводят в AD через SSSD/realmd или Samba/winbind, а не через FreeIPA. FreeIPA выбирают, когда строят идентичность с нуля на Linux или нужна интеграция с Red Hat-стеком. Смешивать их в одном домене без отдельного проекта доверия — плохая идея.»
 
-*Ответ:* DNS 53 (TCP/UDP), Kerberos 88, kpasswd 464, LDAP 389 (и 636 для LDAPS), Global Catalog 3268/3269, SMB 445 (SYSVOL, GPO, смена пароля), NTP 123. Обычно этого достаточно и больше ничего не требуется.
-*Что хочет услышать интервьюер:* знание, что проблема «не вводится в домен» часто упирается в закрытые порты, и что DNS и время — базовые требования Kerberos.
-*Красный флаг:* «откроем всё, чтобы точно работало».
+*Что хочет услышать интервьюер:* что ты не путаешь продукты и понимаешь контекст.
+*Красный флаг:* «FreeIPA — это то же самое, что AD».
+
+**Вопрос 4. «Что такое SSSD и зачем он нужен?»**
+
+Ответ: «SSSD — служба, которая объединяет Kerberos, LDAP и кэш и отдаёт результат в NSS и PAM. Через неё Linux узнаёт доменных пользователей и проверяет их пароли. Настраивается в `/etc/sssd/sssd.conf`, обычно автоматически через `realm join`. Плюс — кэш: если DC временно недоступен, пользователь может войти по закэшированным данным. Логи — `journalctl -u sssd` и `/var/log/sssd/`.»
+
+*Что хочет услышать интервьюер:* понимание, что SSSD — это «клей» между Linux и AD.
+*Красный флаг:* «SSSD — это DNS-сервер».
+
+**Вопрос 5. «Что проверить в первую очередь, если `realm join` падает с ошибкой?»**
+
+Ответ: «Сначала DNS: `dig SRV _kerberos._tcp.<домен>` и `dig SRV _ldap._tcp.<домен>` должны возвращать DC. Потом время: `timedatectl`, разница с DC не больше 5 минут. Потом права: учётка должна иметь право создать объект компьютера в нужном OU. Потом сеть: порты 88, 389, 445, 53 до DC открыты. И только потом смотреть логи `journalctl -u sssd` и `/var/log/sssd/`.»
+
+*Что хочет услышать интервьюер:* порядок проверок и понимание, что 90% проблем — DNS и время.
+*Красный флаг:* «сразу переустанавливаю пакеты».
 
 ## 8. Источники (официальная документация)
 
-- **Microsoft Learn** (`learn.microsoft.com`) — раздел «Active Directory Domain Services»: обзор AD DS, Kerberos, требования к DNS. Поиск: `Active Directory Domain Services overview`.
-- **Ubuntu Server documentation** (`documentation.ubuntu.com`) — раздел про аутентификацию/SSSD и подключение к Active Directory. Поиск: `Ubuntu Server SSSD Active Directory integration`.
-- **realmd** (`freedesktop.org`) — man-страницы `realm`, `realmd`: `man realm`, поиск `realmd documentation`. [ПРОВЕРИТЬ текущую страницу проекта]
-- **SSSD** (`sssd.io`) — документация по `sssd.conf`, `sssctl`, кэшированию. Поиск: `sssd.conf man page`, `sssctl domain-status`.
-- **Samba Wiki** (`wiki.samba.org`) — «Samba as a domain member», настройка `winbind` и idmap. Поиск: `Samba as a domain member idmap config`.
-- **FreeIPA** (`freeipa.org`) — разделы «Trusts» и «Client installation». Поиск: `FreeIPA AD trust`.
-- **Astra Linux** (`wiki.astralinux.ru`) — руководство администратора, раздел про ввод в домен AD (пакет `astra-winbind`) и про ALD Pro. Поиск: `Astra Linux ввод в домен Active Directory astra-winbind`. [ПРОВЕРИТЬ названия модулей GUI в вашей версии]
-- **ALT Linux** (`docs.altlinux.org`) — `alterator-auth`, `system-auth`, `task-auth-ad-sssd`. Поиск: `ALT Linux аутентификация Active Directory alterator`.
-- **РЕД ОС** (`redos.red-soft.ru`) — документация администратора, раздел про домен/аутентификацию. Поиск: `РЕД ОС ввод в домен Active Directory`. [ПРОВЕРИТЬ актуальный раздел]
-
-Дистрибутивы бери только официально: Ubuntu — с `ubuntu.com`, Astra Linux Common Edition и РЕД ОС — с сайтов вендоров (есть бесплатные базовые редакции), ALT — `getalt.org`. Скачивание с торрентов «сборок» — прямой путь к претензии от ИБ и к неизвестному содержимому внутри.
+- **Red Hat Documentation** (docs.redhat.com) — раздел «RHEL: Integrating RHEL systems directly with Windows Active Directory», поиск: `RHEL integrating with Active Directory realmd sssd`.
+- **Red Hat Documentation** — «Managing certifiates / SSSD» [ПРОВЕРИТЬ точное название раздела], поиск: `RHEL SSSD configuration ad provider`.
+- **Samba Project** (samba.org) — раздел «Samba as a Domain Member», поиск: `samba net ads join winbind domain member`.
+- **Microsoft Learn** (learn.microsoft.com) — раздел «Active Directory Domain Services», поиск: `AD DS Kerberos LDAP integration Linux`.
+- **Astra Linux** (astralinux.ru) — официальная документация по Astra Linux Common Edition, раздел про аутентификацию и домен [ПРОВЕРИТЬ точное название раздела и версию], поиск: `Astra Linux ввод в домен Active Directory`.
+- **ALT Linux** (altlinux.org) — документация по вводу в домен AD через `system-auth` / `sssd` [ПРОВЕРИТЬ], поиск: `ALT Linux Active Directory join`.
+- **РЕД ОС** (redos.red-soft.ru) — документация по интеграции с AD [ПРОВЕРИТЬ], поиск: `РЕД ОС ввод в домен Active Directory`.
+- **FreeIPA** (freeipa.org) — официальный сайт, раздел «Documentation», поиск: `FreeIPA client install documentation` (для сравнения, не для ввода в AD).

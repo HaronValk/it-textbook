@@ -2,359 +2,614 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-**Заявка #4127.** Пользователь: `ivanov` (Иван Иванов, бухгалтерия). ВМ: WIN11-CL01. Что написал: «Каждую пятницу я руками проверяю `\\FS01\Buh`: какие отчёты за неделю пришли, какие пустые, сколько места осталось на FS01. Уходит час. Можно сделать так, чтобы в `\\FS01\Obshchee` сам собой появлялся готовый список?» Срочность: плановая, к концу недели.
+Заявка в `C:\Support\Tickets`, 10:42, срочность «средняя»:
 
-Такие заявки — обычная работа L1, который умеет чуть больше, чем «перезагрузите компьютер». И это же твой самый быстрый путь из поддержки в сторону DevOps: PowerShell и Bash (уроки 78–79) закрывают Windows и Linux по отдельности, а Python один и тот же на обоих, и на нём написана половина инфраструктурного мира — Ansible, часть Docker-инструментов, SDK облаков, exporters для Prometheus, клиенты к API Zabbix/GitLab/1С.
+> **Пользователь:** Петрова М. (HR), ВМ WIN10-CL02.
+> **Что написала:** «Каждое утро мне нужно вручную проверять, что наши общие папки на FS01 доступны, и записывать это в отчёт. Я делаю это уже месяц, трачу 15 минут. Можно как-то автоматизировать? И ещё: у меня на рабочем столе накопилось 300 файлов из почты, надо разложить по датам, но руками это ад.»
+> **Срочность:** средняя.
 
-После главы ты должен уметь: поставить Python и не сломать систему пакетами; читать и обходить файлы и папки, в том числе по UNC-пути `\\FS01\...`; проверять доступность порта из кода; дёргать HTTP API, разбирать JSON и ставить таймауты; делать из скрипта нормальную утилиту с параметрами, логом и кодом возврата, чтобы её можно было запускать по cron или из Ansible.
+Петрова просит ровно то, для чего сисадмин и L1 берут Python: автоматизировать рутину, которую руками делать глупо. Проверить доступность папок — это одна сетевая проверка. Разложить 300 файлов по датам — это цикл по каталогу и `os.rename`. Обе задачи на Python решаются в 20–40 строк, читаются через полгода и не ломаются, когда Петрова нажмёт «Enter» не там.
+
+Python в 2026 году — это де-факто «клей» для инфраструктуры: на нём пишут скрипты мониторинга, парсер логов, обёртки над API (Zabbix, GLPI, 1С, облака), Ansible-модули и половину DevOps-инструментов. Для L1 это ещё и язык, на котором можно за 10 минут сделать утилиту, которую потом используют все. После этой главы ты будешь уметь: читать и писать файлы, ходить по каталогам, делать HTTP-запросы к API, проверять доступность хостов и портов, собирать из этого маленькие утилиты с аргументами командной строки и понятным выводом.
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-Python — интерпретируемый язык: файл `.py` читается интерпретатором (эталонная реализация — CPython) сверху вниз и сразу выполняется. Компиляции в exe нет, зато есть байт-код в `__pycache__` — это кэш, на работу не влияет. Блоки кода задаются отступами (4 пробела), типы у переменных динамические.
+Python — интерпретируемый язык. Ты пишешь `.py`-файл, интерпретатор `python3` читает его построчно, компилирует в байткод и выполняет. Никакой компиляции «в exe» для запуска не нужно: на UBU01 достаточно `python3 script.py`. Python 3.12+ идёт в составе Ubuntu Server 24.04 «из коробки», отдельно ставить не надо.
 
-Ключевые понятия, без которых не жить:
+Ключевые для сисадмина модули стандартной библиотеки (то есть уже установлены, `pip install` не нужен):
 
-- **Модуль** — файл `.py` (или встроенный модуль). `import shutil` подключает готовый код.
-- **Стандартная библиотека** — «батарейки в комплекте»: `os`, `pathlib`, `shutil`, `socket`, `json`, `csv`, `argparse`, `logging`, `subprocess`, `datetime`. Для 80% задач сисадмина сторонние пакеты не нужны вообще.
-- **Пакет / pip / PyPI** — сторонние библиотеки (`requests`), устанавливаются утилитой `pip` из репозитория PyPI. Пакеты могут конфликтовать версиями друг с другом.
-- **venv (виртуальное окружение)** — отдельная папка со своим изолированным набором пакетов для конкретного проекта. В Ubuntu 24.04 системный `pip install` запрещён (PEP 668, ошибка `externally-managed-environment`) — именно чтобы ты не сломал системный Python, от которого зависят apt и часть служб. Правильный путь — venv.
+| Модуль | Зачем |
+|--------|-------|
+| `os`, `pathlib` | файлы, каталоги, пути, переменные окружения |
+| `shutil` | копирование, перемещение, удаление каталогов |
+| `subprocess` | запуск внешних команд (`ping`, `ssh`, `systemctl`) |
+| `socket` | TCP/UDP-соединения, проверка портов, DNS-резолв |
+| `urllib.request` | HTTP-запросы без сторонних библиотек |
+| `json` | разбор ответов API |
+| `argparse` | аргументы командной строки (`--host`, `--port`) |
+| `logging` | журнал работы скрипта |
+| `datetime` | даты, время, форматирование |
 
-Где Python лежит в модели OSI: язык сам по себе не «слой», но его вызовы уходят вниз по стеку.
+Сторонние библиотеки (`requests`, `paramiko`, `psutil`) удобнее, но требуют `pip install` и доступа в интернет. На стенде интернет есть через NAT (VMnet8, шлюз 10.10.10.2), но для учебных утилит мы обойдёмся стандартной библиотекой — она работает всегда и на любом сервере, даже без интернета.
+
+Как Python встраивается в работу сисадмина:
 
 ```text
-        твой скрипт make_report.py / api_check.py
-                     │
-   ┌─────────────────┴──────────────────────────────────────┐
-   │ стандартная библиотека Python                          │
-   │  pathlib / os / shutil  → файлы (open, stat, readdir)   │
-   │  csv / json             → форматы данных                │
-   │  socket                 → TCP/UDP  (L4, транспорт)      │
-   │  urllib / requests      → HTTP     (L7, приложение)     │
-   │  argparse / logging     → интерфейс утилиты и журнал    │
-   └─────────────────┬──────────────────────────────────────┘
-                     │ системные вызовы
-   ┌─────────────────┴──────────────────────────────────────┐
-   │ ОС: Linux / Windows  → драйверы → диск / сетевой стек   │
-   └────────────────────────────────────────────────────────┘
+   ┌────────────────────────────────────────────────────────────┐
+   │  Твоя утилита на Python (UBU01 или WIN11-CL01)             │
+   │                                                            │
+   │  argparse  →  логика  →  вывод (stdout / файл / лог)       │
+   │                │                                           │
+   │      ┌─────────┼──────────┬─────────────┐                  │
+   │      ▼         ▼          ▼             ▼                  │
+   │   файлы    socket     urllib       subprocess              │
+   │  (os,      (TCP-      (HTTP к      (ping, ssh,             │
+   │  pathlib)  connect)   API)         systemctl)              │
+   └──────┬─────────┬──────────┬─────────────┬──────────────────┘
+          │         │          │             │
+          ▼         ▼          ▼             ▼
+       локальный  порт 80/443  REST API   внешняя команда
+       диск       на хосте     (JSON)     в ОС
 ```
 
-Порты, которые нам понадобятся в лабе:
+Протоколы, которые ты будешь трогать:
 
-| Порт | Протокол | Кто слушает на стенде |
-|------|----------|------------------------|
-| 53 | DNS (UDP/TCP) | DC01, 10.10.10.10 |
-| 22 | SSH (TCP) | UBU01, 10.10.10.30 |
-| 445 | SMB (TCP) | FS01, 10.10.10.20 |
-| 8080 | HTTP (TCP) | наш тестовый `http.server` на UBU01 |
-
-Важное отличие: `socket` проверяет только «порт открыт / TCP-сессия установилась», а `requests` — полноценный HTTP-запрос (метод, заголовки, тело, код ответа). Открытый порт ≠ работающий сервис: приложение может отвечать 500.
+- **TCP** — `socket.create_connection((host, port), timeout=3)` открывает TCP-соединение. Если порт открыт — успех, если закрыт — `ConnectionRefusedError`, если хост недоступен — `socket.timeout` или `OSError`. Это основа проверки «жив ли сервис».
+- **DNS** — `socket.gethostbyname("dc01.corp.vektor.lab")` резолвит имя в IP через системный резолвер (на UBU01 — `/etc/resolv.conf`, на WIN11-CL01 — DNS-клиент Windows).
+- **HTTP/HTTPS** — `urllib.request.urlopen("http://...")` делает GET-запрос, возвращает объект с `.status`, `.read()`. Для API обычно нужен JSON: `json.loads(response.read())`.
+- **ICMP** — из Python напрямую не отправишь без root и сырых сокетов, поэтому проверку «пингуется ли хост» делают через `subprocess.run(["ping", "-c", "1", host])`.
 
 ## 3. Аналогия из жизни
 
-Python — это конструктор LEGO с готовыми деталями. Тебе нужна «дверь с ручкой» — ты не выпиливаешь её напильником (как в C), а берёшь готовый кирпич `pathlib` и ставишь. Нужен «мост в интернет» — берёшь кирпич `requests`. Библиотеки — это наборы деталей: стандартная библиотека идёт в коробке с конструктором, остальное докупается в магазине (PyPI). `venv` — это отдельная коробка под каждый проект: в одну собираешь машину из деталей версии 2025, в другую — из версии 2026, и они не мешают друг другу.
-
-Аналогия перестаёт работать в одном: детали LEGO никогда не «устаревают» и не ломают друг друга обновлением, а пакеты Python — постоянно, и именно поэтому venv не роскошь, а гигиена.
+Python — это швейцарский армейский нож сисадмина. В нём есть маленькие лезвия на каждый день (открыть файл, пройтись по каталогу), есть отвёртка (сокет — проверить порт), есть штопор (HTTP-запрос к API), и есть отделение, куда можно доложить свои инструменты (`pip install`). Нож не заменяет молоток (Bash для однострочников, PowerShell для Windows-специфики), но когда нужно «и там, и там, и с сохранением результата в файл» — ты тянешься к нему. Аналогия перестаёт работать в одном месте: нож не умеет сам решать, что делать — всю логику «если порт закрыт, напиши в лог и заверши с кодом 1» ты пишешь руками.
 
 ## 4. Практика и команды
 
-**1. Проверка интерпретатора**
+Все примеры — на UBU01 (Ubuntu Server 24.04, `adm.student`, SSH с WIN11-CL01). Python 3 уже стоит.
+
+**1. Проверить версию и запустить первую строку.**
 
 ```bash
 python3 --version
-which python3
-ls -l /usr/bin/python3
+python3 -c "print('hello, vektor')"
 ```
 
-`--version` — версия; `which` — где лежит бинарник. Типичный вывод: `Python 3.12.x` и `/usr/bin/python3`. Смотреть: если версия 3.8 и ниже — часть современных примеров не заработает. На Windows: `python --version` или `py --version` (лаунчер `py` ставится вместе с Python и умеет выбирать версию). Если `python` в Windows открывает Microsoft Store — это заглушка, нужен настоящий установщик.
+`--version` покажет что-то вроде `Python 3.12.3` (точная цифра зависит от образа). `-c` — выполнить строку без файла. Удобно для быстрых проверок.
 
-**2. Виртуальное окружение**
+**2. Прочитать файл и посчитать строки.**
 
 ```bash
-sudo apt install -y python3-venv          # Ubuntu 24.04: без этого пакета venv не создастся
-python3 -m venv ~/venv
-source ~/venv/bin/activate                # приглашение станет (venv)
-deactivate
+python3 - <<'PY'
+from pathlib import Path
+p = Path("/var/log/syslog")
+if p.exists():
+    lines = p.read_text(errors="replace").splitlines()
+    print(f"{p}: {len(lines)} строк")
+else:
+    print(f"{p}: нет файла")
+PY
 ```
+
+`Path.read_text()` читает весь файл в строку. `errors="replace"` — чтобы не падать на бинарных байтах. `splitlines()` режет по переводам строк. Вывод примерно: `/var/log/syslog: 8421 строк`. Для больших файлов лучше `for line in p.open():` — читает построчно, не грузит всё в память.
+
+**3. Пройтись по каталогу и найти файлы по маске.**
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+root = Path("/var/log")
+for f in sorted(root.glob("*.log")):
+    print(f.name, f.stat().st_size, "байт")
+PY
+```
+
+`glob("*.log")` — файлы в каталоге по маске. `stat().st_size` — размер. Вывод примерно: `alternatives.log 12345 байт`. Для рекурсивного поиска — `rglob("*.log")`.
+
+**4. Проверить TCP-порт на хосте.**
+
+```bash
+python3 - <<'PY'
+import socket
+for host, port in [("10.10.10.10", 53), ("10.10.10.10", 3389), ("10.10.10.30", 22)]:
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            print(f"{host}:{port} открыт")
+    except OSError as e:
+        print(f"{host}:{port} закрыт ({e.__class__.__name__})")
+PY
+```
+
+`create_connection` открывает TCP и сразу закрывает (через `with`). `timeout=3` — не висеть вечно. На стенде DC01 (10.10.10.10) слушает 53 (DNS) и 3389 (RDP), UBU01 (10.10.10.30) — 22 (SSH). Вывод примерно: `10.10.10.10:53 открыт`, `10.10.10.10:3389 открыт`, `10.10.10.30:22 открыт`.
+
+**5. Резолв имени в IP.**
+
+```bash
+python3 - <<'PY'
+import socket
+for name in ["dc01.corp.vektor.lab", "ubu01.corp.vektor.lab", "no-such-host.corp.vektor.lab"]:
+    try:
+        print(name, "→", socket.gethostbyname(name))
+    except socket.gaierror as e:
+        print(name, "→ ошибка:", e)
+PY
+```
+
+`gethostbyname` использует системный резолвер. На UBU01 в `/etc/resolv.conf` должен быть `nameserver 10.10.10.10` (это настраивалось в L1 №34). Вывод примерно: `dc01.corp.vektor.lab → 10.10.10.10`, `ubu01.corp.vektor.lab → 10.10.10.30`, `no-such-host.corp.vektor.lab → ошибка: [Errno -2] Name or service not known`.
+
+**6. HTTP-запрос к API и разбор JSON.**
+
+```bash
+python3 - <<'PY'
+import json, urllib.request
+url = "https://api.github.com/repos/python/cpython"
+try:
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read())
+        print("status:", r.status)
+        print("stars:", data.get("stargazers_count"))
+except Exception as e:
+    print("ошибка:", e)
+PY
+```
+
+`urlopen` делает GET. `json.loads(r.read())` превращает байты в словарь. `data.get("stargazers_count")` — безопасно достаёт поле. Вывод примерно: `status: 200`, `stars: 63000` (число меняется). GitHub API без токена ограничен 60 запросами в час с одного IP — для учебных целей хватает. Если GitHub недоступен из РФ — используй любой другой публичный API или локальный сервис (например, `http://10.10.10.10` — IIS на DC01, если роль установлена; на стенде до L1 №80 её нет, поэтому для лабораторной мы обойдёмся без внешнего API).
+
+**7. Запустить внешнюю команду и получить вывод.**
+
+```bash
+python3 - <<'PY'
+import subprocess
+r = subprocess.run(["ping", "-c", "1", "-W", "2", "10.10.10.10"],
+                   capture_output=True, text=True)
+print("код возврата:", r.returncode)
+print(r.stdout.splitlines()[-2] if r.stdout else "нет вывода")
+PY
+```
+
+`subprocess.run` запускает команду. `capture_output=True` — перехватить stdout/stderr. `text=True` — вернуть строки, а не байты. `returncode == 0` — успех. Вывод примерно: `код возврата: 0` и строка статистики `1 packets transmitted, 1 received, 0% packet loss`. На стенде ICMP разрешён на всех ВМ (правило в брандмауэре), поэтому ping до DC01 проходит.
+
+**8. Аргументы командной строки через `argparse`.**
+
+```bash
+cat > /tmp/checkhost.py <<'PY'
+import argparse, socket, sys
+
+def check(host, port, timeout):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def main():
+    ap = argparse.ArgumentParser(description="Проверка TCP-порта")
+    ap.add_argument("host")
+    ap.add_argument("-p", "--port", type=int, default=22)
+    ap.add_argument("-t", "--timeout", type=float, default=3.0)
+    args = ap.parse_args()
+    ok = check(args.host, args.port, args.timeout)
+    print(f"{args.host}:{args.port} {'открыт' if ok else 'закрыт'}")
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()
+PY
+python3 /tmp/checkhost.py 10.10.10.30 -p 22
+python3 /tmp/checkhost.py 10.10.10.10 -p 3389
+echo "код: $?"
+```
+
+`argparse` сам делает `--help`, проверяет типы, ругается на лишние аргументы. `sys.exit(0/1)` — правильный код возврата, чтобы скрипт можно было использовать в `if` и в cron. Вывод: `10.10.10.30:22 открыт`, `10.10.10.10:3389 открыт`, `код: 0`.
+
+**9. Записать результат в файл и в лог.**
+
+```bash
+python3 - <<'PY'
+import logging
+from pathlib import Path
+logging.basicConfig(filename="/tmp/check.log", level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+logging.info("проверка запущена")
+Path("/tmp/result.txt").write_text("ok\n")
+logging.info("результат записан")
+PY
+cat /tmp/check.log
+```
+
+`logging` пишет в файл с датой и уровнем. `Path.write_text` создаёт/перезаписывает файл. Вывод `cat` примерно: `2026-01-15 10:42:01,123 INFO проверка запущена` и вторая строка. В боевой среде лог — это то, по чему ты потом разбираешь, почему скрипт в 3 часа ночи упал.
+
+**10. На Windows (WIN11-CL01) — то же самое через PowerShell.**
 
 ```powershell
-py -m venv .venv
-.venv\Scripts\Activate.ps1
+python --version
+python -c "import socket; print(socket.gethostbyname('dc01.corp.vektor.lab'))"
 ```
 
-`-m venv` — запустить модуль `venv` как программу; аргумент — каталог окружения. Смотреть: после активации `which python` должен показывать `~/venv/bin/python`. На Windows, если PowerShell ругается на политику запуска скриптов, путь такой: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (в боевой среде это согласуют с ИБ, а не делают «на всякий случай»).
-
-**3. Пакеты и фиксация версий**
-
-```bash
-pip install requests
-pip freeze > requirements.txt
-pip install -r requirements.txt
-pip list
-```
-
-`install` — поставить; `freeze` — выгрузить точные версии; `-r` — поставить всё из файла (так делают в CI, урок 83). Вывод `pip list`: имя пакета + версия. Смотреть: не ставишь ли ты пакеты в системный Python (в приглашении нет `(venv)` — значит ставишь не туда).
-
-**4. Проверка синтаксиса и REPL**
-
-```bash
-python3 -m py_compile make_report.py      # только скомпилировать, без запуска
-python3 -i hello.py                       # выполнить и остаться в интерактивном режиме
-```
-
-`py_compile` ловит опечатки и отступы, ничего не выполняя — идеально перед запуском скрипта, который что-то пишет на шару. `-i` — интерактивный режим после выполнения: можно посмотреть значения переменных. Выход — `exit()`.
-
-**5. Файлы: pathlib, stat, обход**
-
-```python
-from pathlib import Path
-
-src = Path(r"\\FS01\Buh")                 # r-строка: обратные слэши не экранируются
-for f in src.rglob("*.xlsx"):             # glob — в одной папке, rglob — рекурсивно
-    st = f.stat()
-    print(f.name, st.st_size, st.st_mtime)
-```
-
-`glob("*.xlsx")` — по маске в текущей папке; `rglob` — включая все подпапки; `stat()` — размер, время изменения, права. Смотреть: `st_size == 0` — пустой файл (частая причина «отчёт не тот»). `f.name` — только имя, `f.parent` — папка, `f.suffix` — расширение. Пути собирай через `Path / "подпапка" / "файл.csv"`, а не склейкой строк — тогда один код работает и на `C:\`, и на `/`.
-
-**6. Свободное место и копирование**
-
-```python
-import shutil
-total, used, free = shutil.disk_usage("/")
-print(f"занято {used/total*100:.1f}%, свободно {free/1024**3:.1f} GiB")
-shutil.copy2("report.csv", "/srv/backup/report.csv")   # copy2 сохраняет время изменения
-```
-
-`disk_usage` возвращает три числа в байтах кортежем. `copy2` копирует с метаданными, `copy` — без. Смотреть: если `/var` лежит в том же разделе, что `/`, цифры совпадут — это нормально, проверять надо точки монтирования (`df -h`).
-
-**7. Сеть: проверка порта**
-
-```python
-import socket
-with socket.create_connection(("10.10.10.10", 53), timeout=3):
-    print("DC01:53 открыт")
-```
-
-`create_connection((host, port), timeout=...)` — пытается установить TCP-сессию. Без `with` соединение надо закрывать руками. Таймаут обязателен: без него скрипт может висеть минуты. Типичные исключения: `ConnectionRefusedError` (хост ответил «закрыто»), `TimeoutError`/`socket.timeout` (не ответил вообще — часто файрвол), `socket.gaierror` (имя не разрешилось). Все они — наследники `OSError`, ловить можно одним `except OSError`.
-
-**8. Локальный HTTP-сервер для теста API**
-
-```bash
-mkdir -p /srv/api && cd /srv/api
-python3 -m http.server 8080 --directory /srv/api
-curl -s http://127.0.0.1:8080/status.json
-```
-
-`-m http.server` — встроенный статический веб-сервер (модуль `http.server`); `--directory` — какую папку отдавать (есть с Python 3.7); порт — первый аргумент. Смотреть: `Serving HTTP on 0.0.0.0 port 8080` в выводе. Это учебный сервер без авторизации — в боевой среде так папку не публикуют, только на localhost или в тестовом сегменте.
-
-**9. HTTP-запрос из кода (requests)**
-
-```python
-import requests
-from requests.exceptions import RequestException
-
-try:
-    r = requests.get("http://10.10.10.30:8080/status.json", timeout=5)
-    r.raise_for_status()          # 4xx/5xx → исключение
-    data = r.json()               # строка JSON → dict
-except RequestException as e:
-    print(f"API недоступен: {e}")
-```
-
-`timeout=5` — ждать не дольше 5 секунд (без него скрипт может висеть вечно); `headers={...}` — заголовки (токен авторизации передают именно там); `params={...}` — query-строка; `r.status_code` — код ответа; `r.text` — тело как строка. Смотреть: `raise_for_status()` обязателен, иначе скрипт «успешно» обработает страницу ошибки 500.
-
-**10. Утилита, а не поделка: argparse, лог, код возврата**
-
-```python
-import argparse, logging, sys
-
-parser = argparse.ArgumentParser(description="Проверка отчётов на \\\\FS01\\Buh")
-parser.add_argument("--src", default=r"\\FS01\Buh")
-parser.add_argument("--debug", action="store_true")
-args = parser.parse_args()
-
-logging.basicConfig(
-    level=logging.DEBUG if args.debug else logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-logging.info("старт, источник: %s", args.src)
-sys.exit(0)   # 0 — успех, 1 — ошибка, 2 — неверные данные
-```
-
-`argparse` сам делает `--help` и проверку аргументов; `action="store_true"` — флаг-переключатель; `logging` пишет с временем и уровнем (в отличие от `print`, можно отправить в файл и в syslog). `sys.exit(0/1/2)` — код возврата: по нему cron, Ansible и мониторинг понимают, что скрипт упал. GitLab CI тоже смотрит именно на код возврата.
+Если Python на WIN11-CL01 не установлен — поставь с python.org (Windows installer, «Add python.exe to PATH»), это бесплатно. Вывод: `Python 3.12.x` и `10.10.10.10`. Дальше все примеры работают так же, только пути Windows (`C:\Support\Tickets`).
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **DC01** (10.10.10.10): AD DS, DNS, DHCP работают, домен `corp.vektor.lab` создан, есть OU, группы `GG-Buh`/`GG-HR`/`GG-Sklad`/`GG-IT` и пользователи `ivanov`, `petrova`, `sidorov`.
-- **FS01** (10.10.10.20): шары `\\FS01\Obshchee` (все), `\\FS01\Buh` (GG-Buh), `\\FS01\HR` (GG-HR).
-- **WIN11-CL01**: `ivanov` залогинен доменной учёткой, адрес по DHCP, шары открываются.
-- **UBU01** (10.10.10.30): Ubuntu Server 24.04, SSH работает, есть выход в интернет через NAT VMnet8 (для `apt` и `pip`).
-
-Если FS01 ещё не поднят — сначала пройди тему про файловые шары L1; минимум для лабы: две шары `Buh` и `Obshchee` с правами по группам.
+- UBU01 (10.10.10.30, Ubuntu Server 24.04, `adm.student`, SSH включён) — работает, доступен по SSH с WIN11-CL01.
+- DC01 (10.10.10.10) — работает, отвечает на ping, слушает 53 (DNS) и 3389 (RDP). Домен `corp.vektor.lab` развёрнут (L1 №42), DNS-зона `corp.vektor.lab` есть (L1 №34).
+- WIN11-CL01 (10.10.10.51, DHCP с L1 №33) — работает, вход `VEKTOR\ivanov` или `adm.student`.
+- FS01 (10.10.10.20) — работает, общие папки `\\FS01\Obshchee`, `\\FS01\Buh`, `\\FS01\HR` (L1 №46).
+- На UBU01 установлен `python3` (входит в Ubuntu Server 24.04). Проверить: `python3 --version`.
+- На WIN11-CL01 Python может отсутствовать — если так, установить с python.org (Windows installer, «Add python.exe to PATH»).
 
 ### Снапшот
 
-В VMware Workstation на каждой затрагиваемой ВМ: **VM → Snapshot → Take Snapshot**, имя `before-l1-080`. Машины: **UBU01**, **WIN11-CL01**, **FS01**.
+На хосте, в PowerShell:
+
+```powershell
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-080
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-080
+```
+
+WIN11-CL01 зашифрована (vTPM), поэтому для неё нужен пароль шифрования:
+
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-080
+```
+
+[ПРОВЕРИТЬ синтаксис `-vp` в твоей версии VMware Workstation.] DC01 и FS01 не трогаем — мы их только опрашиваем по сети, изменений нет.
 
 ### Шаги
 
-1. **UBU01, по SSH.** `python3 --version` → ожидаем `Python 3.12.x`. Затем `sudo apt update && sudo apt install -y python3-venv` → установка без ошибок.
-2. **UBU01.** `python3 -m venv ~/venv && source ~/venv/bin/activate && pip install requests` → в приглашении появилось `(venv)`, `pip install` завершился строкой `Successfully installed ...`. Зафиксируй: `pip freeze > ~/requirements.txt`.
-3. **UBU01.** Создай `~/python-lab/hello.py`: переменная, f-строка, список, словарь, цикл `for`, `if`. Запусти `python3 hello.py` → ожидаемый вывод с твоими значениями. Это тренировка синтаксиса на 5 минут, без неё дальше будет больно.
-4. **UBU01.** Создай `~/python-lab/disk_check.py` на базе `shutil.disk_usage("/")` с порогом 80%: печатает процент и `OK`/`ALARM`, при `ALARM` делает `sys.exit(1)`. Запусти `python3 disk_check.py; echo "код: $?"` → видишь процент и код `0`.
-5. **UBU01.** Создай `~/python-lab/check_port.py` со списком целей: `("DC01", "10.10.10.10", 53)`, `("FS01", "10.10.10.20", 445)`, `("UBU01", "10.10.10.30", 22)`, `("FS01-RDP", "10.10.10.20", 3389)`, таймаут 3 секунды, обработка `OSError`. Запусти → три «открыт», четвёртый «НЕДОСТУПЕН».
-6. **UBU01.** `sudo mkdir -p /srv/api`, создай `/srv/api/status.json` с содержимым `{"service": "vektor-status", "version": "1.0", "state": "ok"}`. Запусти в фоне: `nohup python3 -m http.server 8080 --directory /srv/api &`. Проверь `curl -s http://127.0.0.1:8080/status.json` → тот же JSON. Если `ufw` включён — `sudo ufw allow 8080/tcp` (на стенде это допустимо; в боевой среде открывают порт только осознанно и с ограничением по источнику).
-7. **WIN11-CL01, PowerShell.** `Invoke-RestMethod http://10.10.10.30:8080/status.json` → объект с полями `service/version/state`. Это проверка, что сервис виден из офисной сети, а не только с localhost.
-8. **UBU01.** Создай `~/python-lab/api_check.py` на `requests` (код из п. 9 раздела 4). Запусти → `Сервис: vektor-status, версия 1.0, состояние ok`. Останови сервер (`kill %1` или `pkill -f http.server`) и запусти снова → понятная ошибка и код возврата `1`.
-9. **WIN11-CL01.** Установи Python с python.org (кнопка Download, установщик Windows). В установщике галочка **Add python.exe to PATH**; если у `ivanov` нет прав администратора — сними **Install for all users**, тогда ставится в профиль. Проверь `python --version`. (Альтернатива через пакетный менеджер: `winget install Python.Python.3.12` `[ПРОВЕРИТЬ]` актуальный идентификатор пакета.)
-10. **WIN11-CL01, PowerShell.** Подготовь данные: `New-Item -Path '\\FS01\Buh\otchet-2026-01.xlsx' -ItemType File` и ещё пару таких файлов, один оставь пустым (0 байт), в один запиши текст: `"тест" | Out-File '\\FS01\Buh\otchet-2026-02.xlsx'`. В реальности там лежат настоящие выгрузки из 1С.
-11. **WIN11-CL01.** Создай `C:\python-lab\make_report.py` — скрипт из начала раздела «Сломай и почини» (версия без `argparse`): обходит `Path(r"\\FS01\Buh").glob("*.xlsx")`, собирает имя/размер/дату/признак пустого, пишет CSV в `\\FS01\Obshchee\reports` с `encoding="utf-8-sig"` (чтобы Excel открыл кириллицу без кракозябр). Запусти: `python C:\python-lab\make_report.py` → `Готово: \\FS01\Obshchee\reports\report-2026-...csv, файлов проверено: 3`.
-12. **WIN11-CL01.** Открой CSV в Excel или Блокноте, убедись, что пустой файл помечен. Запиши изменения в `stand-log.md`. Опционально: поставь запуск по расписанию на UBU01 через cron — механику ты уже разбирал в уроке 79, здесь просто вызываешь `python3 disk_check.py` из `crontab`.
+1. **На WIN11-CL01** открой PowerShell, подключись к UBU01:
+    ```powershell
+    ssh adm.student@10.10.10.30
+    ```
+    Ожидаемо: приглашение `adm.student@ubu01:~$`.
+
+2. **На UBU01** проверь Python:
+    ```bash
+    python3 --version
+    ```
+    Ожидаемо: `Python 3.12.x`.
+
+3. **На UBU01** создай рабочую папку и первый скрипт — проверка TCP-портов:
+    ```bash
+    mkdir -p ~/scripts && cd ~/scripts
+    cat > check_ports.py <<'PY'
+    import argparse, socket, sys
+
+    def check(host, port, timeout):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def main():
+        ap = argparse.ArgumentParser(description="Проверка TCP-портов")
+        ap.add_argument("host")
+        ap.add_argument("-p", "--ports", default="22,53,3389,445",
+                        help="список портов через запятую")
+        ap.add_argument("-t", "--timeout", type=float, default=3.0)
+        args = ap.parse_args()
+        ports = [int(x) for x in args.ports.split(",")]
+        bad = 0
+        for p in ports:
+            ok = check(args.host, p, args.timeout)
+            print(f"{args.host}:{p:<5} {'открыт' if ok else 'закрыт'}")
+            if not ok:
+                bad += 1
+        sys.exit(0 if bad == 0 else 1)
+
+    if __name__ == "__main__":
+        main()
+    PY
+    ```
+    Ожидаемо: файл создан, ошибок нет.
+
+4. **На UBU01** запусти проверку DC01:
+    ```bash
+    python3 check_ports.py 10.10.10.10
+    ```
+    Ожидаемо примерно: `10.10.10.10:22 закрыт`, `10.10.10.10:53 открыт`, `10.10.10.10:3389 открыт`, `10.10.10.10:445 открыт`. SSH на DC01 не настроен — порт 22 закрыт, это нормально. Код возврата будет 1 (есть закрытые порты) — проверь `echo $?`.
+
+5. **На UBU01** запусти проверку FS01 (порт 445 — SMB):
+    ```bash
+    python3 check_ports.py 10.10.10.20 -p 445,3389
+    ```
+    Ожидаемо: `10.10.10.20:445 открыт`, `10.10.10.20:3389 открыт`. Если 445 закрыт — проверь, что FS01 включена и брандмауэр не блокирует SMB (на стенде правило SMB включено по умолчанию при роли «Файловый сервер»).
+
+6. **На UBU01** напиши утилиту «разложить файлы по датам» — та самая задача Петровой:
+    ```bash
+    cat > sort_by_date.py <<'PY'
+    import argparse, shutil
+    from datetime import datetime
+    from pathlib import Path
+
+    def main():
+        ap = argparse.ArgumentParser(description="Разложить файлы по папкам YYYY-MM")
+        ap.add_argument("src", help="исходный каталог")
+        ap.add_argument("--dry-run", action="store_true", help="только показать")
+        args = ap.parse_args()
+        src = Path(args.src)
+        if not src.is_dir():
+            raise SystemExit(f"нет каталога: {src}")
+        moved = 0
+        for f in src.iterdir():
+            if not f.is_file():
+                continue
+            mtime = datetime.fromtimestamp(f.stat().st_mtime)
+            dst_dir = src / mtime.strftime("%Y-%m")
+            dst = dst_dir / f.name
+            if args.dry_run:
+                print(f"{f.name} -> {dst_dir.name}/")
+                continue
+            dst_dir.mkdir(exist_ok=True)
+            shutil.move(str(f), str(dst))
+            moved += 1
+        print(f"перемещено: {moved}")
+
+    if __name__ == "__main__":
+        main()
+    PY
+    ```
+    Ожидаемо: файл создан.
+
+7. **На UBU01** создай тестовые файлы и прогони утилиту в режиме `--dry-run`:
+    ```bash
+    mkdir -p /tmp/inbox && cd /tmp/inbox
+    for i in 1 2 3; do echo "test $i" > "file$i.txt"; done
+    touch -d "2025-11-15" file1.txt
+    touch -d "2025-12-01" file2.txt
+    touch -d "2026-01-10" file3.txt
+    python3 ~/scripts/sort_by_date.py /tmp/inbox --dry-run
+    ```
+    Ожидаемо примерно: `file1.txt -> 2025-11/`, `file2.txt -> 2025-12/`, `file3.txt -> 2026-01/`. Файлы на месте.
+
+8. **На UBU01** прогони без `--dry-run` и проверь результат:
+    ```bash
+    python3 ~/scripts/sort_by_date.py /tmp/inbox
+    find /tmp/inbox -type f | sort
+    ```
+    Ожидаемо: `перемещено: 3`, затем `find` покажет `/tmp/inbox/2025-11/file1.txt`, `/tmp/inbox/2025-12/file2.txt`, `/tmp/inbox/2026-01/file3.txt`.
+
+9. **На UBU01** напиши утилиту «отчёт о доступности» — проверка списка хостов и запись в лог:
+    ```bash
+    cat > availability.py <<'PY'
+    import argparse, logging, socket
+    from pathlib import Path
+
+    def main():
+        ap = argparse.ArgumentParser(description="Отчёт о доступности хостов")
+        ap.add_argument("--hosts-file", required=True)
+        ap.add_argument("--port", type=int, default=445)
+        ap.add_argument("--log", default="/tmp/availability.log")
+        args = ap.parse_args()
+        logging.basicConfig(filename=args.log, level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(message)s")
+        hosts = [l.strip() for l in Path(args.hosts_file).read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
+        up = 0
+        for h in hosts:
+            try:
+                with socket.create_connection((h, args.port), timeout=3):
+                    logging.info("%s:%s OK", h, args.port)
+                    print(f"{h}: OK")
+                    up += 1
+            except OSError as e:
+                logging.warning("%s:%s FAIL %s", h, args.port, e.__class__.__name__)
+                print(f"{h}: FAIL")
+        print(f"итого: {up}/{len(hosts)} доступны")
+
+    if __name__ == "__main__":
+        main()
+    PY
+    cat > hosts.txt <<'TXT'
+    # серверы Вектора
+    10.10.10.10
+    10.10.10.20
+    10.10.10.30
+    TXT
+    python3 availability.py --hosts-file hosts.txt --port 445
+    ```
+    Ожидаемо примерно: `10.10.10.10: OK`, `10.10.10.20: OK`, `10.10.10.30: FAIL` (на UBU01 нет SMB), `итого: 2/3 доступны`. Лог в `/tmp/availability.log`.
+
+10. **На UBU01** проверь лог:
+    ```bash
+    cat /tmp/availability.log
+    ```
+    Ожидаемо примерно: три строки с датой, `INFO` для OK и `WARNING` для FAIL.
+
+11. **На WIN11-CL01** (в PowerShell, не в SSH) проверь, что Python работает и там:
+    ```powershell
+    python --version
+    python -c "import socket; print(socket.gethostbyname('dc01.corp.vektor.lab'))"
+    ```
+    Ожидаемо: `Python 3.12.x` и `10.10.10.10`. Если Python не установлен — установи с python.org и повтори.
+
+12. **На WIN11-CL01** скопируй скрипт с UBU01 и запусти локально:
+    ```powershell
+    scp adm.student@10.10.10.30:~/scripts/check_ports.py C:\Support\check_ports.py
+    python C:\Support\check_ports.py 10.10.10.20 -p 445
+    ```
+    Ожидаемо: `10.10.10.20:445 открыт`. Скрипт одинаково работает на Linux и Windows — в этом и сила Python.
 
 ### Проверка
 
-- [ ] `python3 --version` на UBU01 и `python --version` на WIN11-CL01 дают 3.12.x / 3.x.
-- [ ] `pip freeze` содержит `requests` и запускается только внутри `(venv)`.
-- [ ] `check_port.py` показывает открытыми 53 на DC01, 445 на FS01, 22 на UBU01 и недоступным 3389.
-- [ ] `curl` и `Invoke-RestMethod` возвращают один и тот же JSON со статусом.
-- [ ] `api_check.py` при остановленном сервере завершается с кодом `1` и внятным сообщением.
-- [ ] В `\\FS01\Obshchee\reports` лежит CSV с тремя строками и корректной кириллицей.
-- [ ] В `stand-log.md` записано: UBU01 — venv, `~/python-lab`, `/srv/api`, порт 8080; WIN11-CL01 — Python, `C:\python-lab`; FS01 — папка `reports` и тестовые .xlsx.
+- [ ] `python3 --version` на UBU01 показывает 3.12.x.
+- [ ] `check_ports.py 10.10.10.10` показывает 53 и 3389 открытыми.
+- [ ] `check_ports.py 10.10.10.20 -p 445` показывает 445 открытым.
+- [ ] `sort_by_date.py /tmp/inbox --dry-run` показывает три папки по месяцам.
+- [ ] После прогона без `--dry-run` файлы лежат в `/tmp/inbox/2025-11/`, `/tmp/inbox/2025-12/`, `/tmp/inbox/2026-01/`.
+- [ ] `availability.py --hosts-file hosts.txt --port 445` показывает 2/3 доступны.
+- [ ] `/tmp/availability.log` содержит строки с датой и уровнями INFO/WARNING.
+- [ ] На WIN11-CL01 `python --version` работает, `check_ports.py` запускается.
 
 ### Сломай и почини
 
-> **Заявка #4131.** Пользователь: `ivanov`. ВМ: WIN11-CL01. Что написал: «Ваш скрипт `make_report.py` сегодня утром прислал пустой отчёт — ни одного файла внутри. Вчера всё было. Я тут просто разложил отчёты по папкам, чтобы не мешались». Срочность: средняя, отчёт нужен к 15:00.
+**Заявка:**
 
-**Воспроизведение поломки** (WIN11-CL01, от имени `ivanov`):
+> **Пользователь:** Петрова М. (HR), ВМ WIN10-CL02.
+> **Что написала:** «Ваш скрипт `availability.py` перестал работать. Запускаю — пишет `итого: 0/3 доступны`, хотя вчера всё было зелёное. Мне нужен отчёт для руководства к 15:00.»
+> **Срочность:** высокая.
 
-```powershell
-New-Item -Path '\\FS01\Buh\Текущие' -ItemType Directory
-New-Item -Path '\\FS01\Buh\Архив' -ItemType Directory
-Move-Item '\\FS01\Buh\*.xlsx' -Destination '\\FS01\Buh\Текущие'
-python C:\python-lab\make_report.py
+**Как воспроизвести поломку** (на UBU01, от `adm.student`):
+
+```bash
+sudo ufw enable
+sudo ufw default deny outgoing
 ```
 
-Скрипт отработает «успешно» и создаст CSV без строк. Это худший вид поломки: ошибки нет, результат неверный.
+`ufw` на UBU01 в этом состоянии стенда не настроен (в L1 №39 разбирали теорию, но не включали), поэтому команды включат файрвол с политикой «запретить исходящие». Теперь любой TCP-коннект из Python будет падать с `OSError` (таймаут или `Permission denied`). Это ровно то, что видит Петрова: все хосты FAIL.
 
 **Диагностика по шагам:**
 
-1. Запусти скрипт руками и посмотри вывод: `файлов проверено: 0`. Кода возврата `0` — скрипт считает, что всё хорошо. Вот и первый дефект: нет защиты от пустого результата.
-2. Проверь, что шаблон вообще есть: `Get-ChildItem '\\FS01\Buh' -Filter *.xlsx` → пусто. А `Get-ChildItem '\\FS01\Buh' -Recurse -Filter *.xlsx` → файлы в `Текущие`.
-3. Проверь доступ к шаре, чтобы исключить права: `whoami /groups | findstr GG-Buh` (должна быть группа) и `net use \\FS01\Buh` → «Команда выполнена успешно». Значит, дело не в правах, а в пути.
-4. Проверь, что скрипт видит именно то, что ты думаешь: добавь `print(src, src.exists())` или запусти `python -i C:\python-lab\make_report.py` и посмотри `src` в интерактивном режиме. `exists()` → `True`, а `glob("*.xlsx")` пуст — значит, файлы ушли в подпапки.
-5. Сверь с логом прошлых запусков (если вёл): вчерашний отчёт содержал 3 файла — данные менялись, скрипт нет. Классика: «работало — сломалось» = изменились входные данные.
+1. Запусти скрипт вручную и посмотри на ошибку:
+    ```bash
+    python3 ~/scripts/availability.py --hosts-file hosts.txt --port 445
+    ```
+    Ожидаемо: `10.10.10.10: FAIL`, `10.10.10.20: FAIL`, `10.10.10.30: FAIL`, `итого: 0/3 доступны`.
 
-**Решение** — переписать скрипт так, чтобы он и находил файлы рекурсивно, и не молчал при пустом результате:
+2. Проверь, что сеть вообще жива — ping до DC01:
+    ```bash
+    ping -c 1 10.10.10.10
+    ```
+    Ожидаемо: ping проходит (ICMP разрешён на всех ВМ). Значит, проблема не в сети, а в чём-то локальном.
 
-```python
-import argparse, csv, sys
-from datetime import date
-from pathlib import Path
+3. Проверь TCP вручную через `nc` (если установлен) или через Python:
+    ```bash
+    python3 -c "import socket; socket.create_connection(('10.10.10.10', 53), timeout=3)"
+    ```
+    Ожидаемо: `OSError` или `TimeoutError`. TCP не идёт, хотя ICMP идёт — типичный признак локального файрвола.
 
-parser = argparse.ArgumentParser(description="Отчёт по файлам в \\\\FS01\\Buh")
-parser.add_argument("--src", default=r"\\FS01\Buh")
-parser.add_argument("--dst", default=r"\\FS01\Obshchee\reports")
-args = parser.parse_args()
+4. Посмотри статус файрвола:
+    ```bash
+    sudo ufw status verbose
+    ```
+    Ожидаемо: `Status: active`, `Default: deny (incoming), deny (outgoing)`.
 
-src, dst = Path(args.src), Path(args.dst)
-files = sorted(src.rglob("*.xlsx"))
-if not files:
-    print(f"ОШИБКА: в {src} не найдено ни одного *.xlsx", file=sys.stderr)
-    sys.exit(2)
+5. Посмотри правила:
+    ```bash
+    sudo ufw status numbered
+    ```
+    Ожидаемо: пусто или только стандартные правила, исходящие запрещены.
 
-dst.mkdir(parents=True, exist_ok=True)
-rows = []
-for f in files:
-    st = f.stat()
-    rows.append({
-        "file": str(f.relative_to(src)),
-        "size_kb": round(st.st_size / 1024, 1),
-        "modified": date.fromtimestamp(st.st_mtime).isoformat(),
-        "empty": "да" if st.st_size == 0 else "нет",
-    })
+**Решение:**
 
-report = dst / f"report-{date.today().isoformat()}.csv"
-with report.open("w", newline="", encoding="utf-8-sig") as fh:
-    w = csv.DictWriter(fh, fieldnames=["file", "size_kb", "modified", "empty"])
-    w.writeheader()
-    w.writerows(rows)
-
-print(f"Готово: {report}, файлов проверено: {len(rows)}")
+```bash
+sudo ufw default allow outgoing
+sudo ufw reload
+python3 ~/scripts/availability.py --hosts-file hosts.txt --port 445
 ```
 
-Запусти снова: `python C:\python-lab\make_report.py` → `файлов проверено: 3`, в CSV видны пути `Текущие\otchet-...`. Проверь защиту: `python C:\python-lab\make_report.py --src \\FS01\HR` (у `ivanov` нет прав) → внятная ошибка, а не пустой отчёт.
+Ожидаемо: снова `2/3 доступны` (UBU01 без SMB — это норма). Если Петровой нужен только отчёт, файрвол можно оставить включённым с разрешёнными исходящими — это правильная настройка. Если файрвол на UBU01 не нужен вообще (учебный стенд), можно `sudo ufw disable`, но в боевой среде так не делают.
 
-**Ответ пользователю:** «Иван, причина — файлы переехали в подпапки `Текущие`, а скрипт искал их только в корне `Buh`. Переписал: теперь он смотрит на два уровня вглубь, а если файлов не найдёт — напишет об этом и завершится с ошибкой, а не пришлёт пустой отчёт. Проверьте, пожалуйста, сегодняшний файл в `\\FS01\Obshchee\reports`: в нём 3 строки, путь каждого файла указан. Если понадобится искать и в `Архив` — он тоже попадает в отчёт, скажите, если нужно наоборот исключить. Заявку закрываю, при следующей раскладке по папкам напишите — подправлю путь за пять минут.»
+**Ответ пользователю:**
 
-**Закрытие:** в тикете — причина, что сделано, куда смотреть результат, кто проверял; в `stand-log.md` — что изменилось в скрипте и в папках FS01.
+> Мария, добрый день. Проблема была не в скрипте, а в настройках файрвола на сервере, где он запускается: исходящие соединения были запрещены, поэтому скрипт не мог достучаться до серверов. Исправил, отчёт снова формируется, 2 из 3 хостов доступны (третий — сам сервер, на нём нет SMB, это норма). Прикладываю свежий лог. Если повторится — сразу пишите, разберёмся за 5 минут.
+
+**Закрытие заявки:** категория «Скрипты и автоматизация», решение «исправлена политика ufw (default allow outgoing)», время — 15 минут, приоритет высокий → закрыто после подтверждения от Петровой.
 
 ### Что изменилось на стенде
 
-- **UBU01**: установлен пакет `python3-venv`; создано окружение `~/venv` (внутри `requests`); каталог `~/python-lab` со скриптами `hello.py`, `disk_check.py`, `check_port.py`, `api_check.py`; каталог `/srv/api` с `status.json`; периодически запускается `http.server` на порту 8080.
-- **WIN11-CL01**: установлен Python в профиль `ivanov`, `PATH` дополнен; каталог `C:\python-lab` со скриптом `make_report.py` (версия с `argparse` и защитой от пустого результата).
-- **FS01**: в `\\FS01\Buh` — тестовые файлы `otchet-2026-01.xlsx`, `otchet-2026-02.xlsx` и подпапки `Текущие`, `Архив`; в `\\FS01\Obshchee` — подпапка `reports` с CSV-отчётами. Права не менялись.
-- **DC01**: без изменений.
+- На UBU01 созданы файлы: `~/scripts/check_ports.py`, `~/scripts/sort_by_date.py`, `~/scripts/availability.py`, `~/scripts/hosts.txt`.
+- На UBU01 создан каталог `/tmp/inbox` с подкаталогами `2025-11`, `2025-12`, `2026-01` и файлами внутри.
+- На UBU01 создан `/tmp/availability.log`.
+- На UBU01 в ходе «Сломай и почини» включался `ufw`; после решения — `default allow outgoing`, `ufw` остаётся `active` (если решил оставить) или `disabled` (если отключил). Зафиксируй в `stand-log.md`, что именно.
+- На WIN11-CL01 скопирован `C:\Support\check_ports.py`; при необходимости установлен Python с python.org.
+- Роли, домен, учётки, адреса — без изменений.
 
 ### Откат
 
-VMware Workstation → выбери ВМ → **VM → Snapshot → Snapshot Manager** → выбери `before-l1-080` → **Go To**. Откатывать нужно все три ВМ (UBU01, WIN11-CL01, FS01), иначе получишь рассинхрон: скрипт есть, а папки `reports` нет. После отката обнови `stand-log.md`, чтобы журнал соответствовал реальному состоянию.
+В PowerShell на хосте:
+
+```powershell
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-080
+vmrun -T ws -vp "Lab#2026-vektor" revertToSnapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-080
+```
+
+[ПРОВЕРИТЬ синтаксис `-vp` в твоей версии.] После отката все скрипты и `/tmp/inbox` исчезнут, `ufw` вернётся в состояние до лабораторной.
 
 ## 6. Ошибки новичков и безопасность
 
-1. **`pip install` без venv** → в Ubuntu 24.04 получишь `error: externally-managed-environment`, а если обойти флагом `--break-system-packages` — риск сломать системный Python и apt. Правильно: venv на каждый проект.
-2. **Пароли и токены прямо в коде** → скрипт уезжает в Git (урок 77), и токен утекает. Правильно: `os.environ.get("TOKEN")`, локальный `.env` в `.gitignore`, в боевой среде — секреты из хранилища.
-3. **Нет `timeout` в `requests.get`/`socket`** → скрипт висит в cron, запуски наслаиваются друг на друга, мониторинг молчит. Правильно: таймаут всегда, обычно 3–10 секунд.
-4. **`except:` без указания типа** → глотает `Ctrl+C`, ошибки в имени переменной и опечатки, скрипт «работает», а результата нет. Правильно: ловить конкретные `RequestException`, `OSError`, `FileNotFoundError`.
-5. **`print` вместо `logging`** → в cron весь вывод уходит в почту/никуда, разбираться нечем. Правильно: `logging` с уровнем и хотя бы минимальным форматом.
-6. **Пустой результат = успех** → ровно наша поломка: отчёт без строк ушёл пользователю как валидный. Правильно: проверять входные данные и завершаться с кодом ≠ 0.
-7. **Жёсткие пути `C:\Users\ivanov\...`** → на другой машине или в Linux не работает. Правильно: `pathlib`, пути из аргументов, значения по умолчанию.
-8. **Запуск от администратора/root «чтобы точно сработало»** → скрипт с ошибкой в пути удалит или перезапишет лишнее с полными правами. Правильно: запускать от той учётки, которой хватает прав по задаче.
+1. **Ошибка:** хардкодить IP и пароли в скрипте. **К чему приводит:** при смене адреса (например, DHCP в L1 №33 выдал другой) скрипт ломается, а пароль утекает в Git. **Как правильно:** аргументы через `argparse`, конфиг в файле, пароли — в переменных окружения или в защищённом хранилище (на стенде — просто не коммить).
 
-**Безопасность.** В боевой среде нельзя: печатать в лог пароли, токены и персональные данные сотрудников (у нас в отчёте только имена файлов — и это не случайно); отключать проверку TLS в `requests` (`verify=False`) «потому что сертификат не тот» — так теряется защита от подмены; качать скрипт из чата и запускать не читая; публиковать `http.server` в офисную сеть без пароля и ограничения по адресам — это открытая папка для всех. На стенде учебный пароль `Lab#2026-vektor` и открытый порт 8080 допустимы только потому, что стенд изолирован в VMware.
+2. **Ошибка:** `except:` без указания исключения. **К чему приводит:** скрипт «молча» глотает любую ошибку, включая `KeyboardInterrupt`, и ты не понимаешь, почему он не работает. **Как правильно:** ловить конкретные исключения (`OSError`, `socket.timeout`, `json.JSONDecodeError`) и логировать их.
 
-## 7. Вопросы на собеседовании
+3. **Ошибка:** читать весь лог в память через `read_text()`. **К чему приводит:** на файле в 2 ГБ скрипт съедает всю RAM и падает по OOM. **Как правильно:** `for line in open(path):` — построчно.
 
-**1. Что такое виртуальное окружение и зачем оно нужно?**
+4. **Ошибка:** `subprocess.run(cmd, shell=True)` с подстановкой пользовательских данных. **К чему приводит:** инъекция команд (`; rm -rf /`). **Как правильно:** передавать список аргументов `["ping", "-c", "1", host]` без `shell=True`.
 
-Ответ: это изолированный набор пакетов для проекта в отдельной папке. Создаётся `python3 -m venv venv`, активируется `source venv/bin/activate` (Windows — `.venv\Scripts\Activate.ps1`), внутри `pip install` ставит пакеты только туда. Нужно, чтобы проекты с разными версиями одной библиотеки не конфликтовали и чтобы не ломать системный Python, от которого зависят apt и службы ОС. Версии фиксируются в `requirements.txt` через `pip freeze`.
+5. **Ошибка:** забыть `timeout` в `socket.create_connection`. **К чему приводит:** скрипт висит минутами на недоступном хосте. **Как правильно:** всегда `timeout=3` (или разумное значение).
 
-*Что хочет услышать интервьюер:* что ты понимаешь проблему зависимостей, а не просто «так принято», и знаешь `requirements.txt`.
+6. **Ошибка:** запускать скрипт от `root`, потому что «так проще». **К чему приводит:** любая ошибка в скрипте — потенциальное удаление системных файлов. **Как правильно:** запускать от обычного пользователя, `sudo` — только там, где реально нужно (например, чтение `/var/log/auth.log`).
 
-*Красный флаг:* «я всё ставлю через `sudo pip install`, мне так удобнее» или совет использовать `--break-system-packages` как обычную практику.
+7. **Ошибка:** не проверять код возврата внешней команды. **К чему приводит:** скрипт считает, что `ping` сработал, хотя он вернул 1. **Как правильно:** `if r.returncode != 0: ...`.
 
-**2. Как прочитать большой файл, не загружая его в память целиком?**
+8. **Ошибка:** коммитить `__pycache__`, `.venv`, логи и токены в Git. **К чему приводит:** мусор в репозитории, утечка секретов. **Как правильно:** `.gitignore` с `__pycache__/`, `*.log`, `.env`.
 
-Ответ: итерировать по файловому объекту построчно — `with open(path, encoding="utf-8") as f: for line in f:`; для CSV — `csv.reader(f)` в том же цикле. `f.readlines()` и `f.read()` загружают всё в память: на логе в 5 ГБ это гарантированный отказ. `with` закрывает файл даже при исключении.
+### Безопасность
 
-*Что хочет услышать интервьюер:* понимание, что скрипт может уронить сервер памятью, и знание `with`.
+- **Не запускай скрипты из интернета без чтения.** `curl ... | python3` — это выполнение произвольного кода с правами твоего пользователя. Скачай, прочитай, потом запускай.
+- **Не храни пароли в скриптах и в Git.** На стенде пароль `Lab#2026-vektor` — учебный, но привычка должна быть правильной: в боевой среде пароль в коде = инцидент ИБ.
+- **Не отключай файрвол «чтобы работало».** В лабораторной мы включили `ufw` и разрешили исходящие — это правильная настройка. `ufw disable` на боевом сервере — грубое нарушение.
+- **Не давай скрипту больше прав, чем нужно.** Если скрипт только читает лог — он не должен работать от `root`.
+- **Логируй, но не логируй секреты.** В `logging.info` не должно попадать содержимое токенов и паролей.
 
-*Красный флаг:* «прочитать всё в список и потом обработать» без оговорок про размер.
+## 7. Вопросы на собеседовании (3–5 вопросов с ответами)
 
-**3. Как проверить из Python, что сервис доступен? Чем проверка порта отличается от проверки HTTP?**
+**Вопрос 1. Зачем сисадмину Python, если есть Bash и PowerShell?**
 
-Ответ: порт — `socket.create_connection((host, port), timeout=3)` в `try/except OSError`; открытый TCP-порт значит, что кто-то слушает. HTTP — `requests.get(url, timeout=5)` плюс `raise_for_status()`: только код 2xx говорит, что приложение реально работает. Открытый порт при этом может отдавать 500 или висеть без ответа, поэтому проверять надо оба уровня. И всегда ставить таймаут.
+Как её задают: «У нас Linux и Windows, зачем ещё Python?»
 
-*Что хочет услышать интервьюер:* различение L4 и L7, обязательность таймаута, обработку исключений.
+Ответ: Bash хорош для однострочников и склейки команд, PowerShell — для Windows-специфики (AD, WMI, реестр). Python выигрывает там, где нужна логика: разбор JSON от API, работа с файлами и каталогами, кроссплатформенность (один скрипт работает и на Linux, и на Windows), нормальная обработка ошибок и тесты. На стенде я делал утилиту проверки портов — она одинаково запускается на UBU01 и на WIN11-CL01, а на Bash пришлось бы писать две версии.
 
-*Красный флаг:* проверять доступность через `ping` и считать это доказательством работы сервиса.
+Что хочет услышать интервьюер: понимание, что язык — инструмент под задачу, а не религия.
 
-**4. Как сделать из скрипта нормальную утилиту для cron или Ansible?**
+Красный флаг: «Python лучше всех, Bash не нужен».
 
-Ответ: параметры через `argparse` (с `--help` и значениями по умолчанию), журналирование через `logging`, коды возврата через `sys.exit` (0 — успех, 1 — ошибка выполнения, 2 — неверные данные/аргументы), отсутствие интерактивных вопросов (`input()` в cron не работает), идемпотентность — повторный запуск не должен ломать данные. Секреты — из переменных окружения, а не из кода.
+**Вопрос 2. Как проверить, что сервис на хосте доступен, из Python?**
 
-*Что хочет услышать интервьюер:* что ты думаешь про автоматический запуск, а не про «запущу руками в консоли».
+Как её задают: «Напиши проверку, что порт 445 на FS01 открыт».
 
-*Красный флаг:* «выйдет с 0 в любом случае, чтобы cron не ругался» — это как раз то, из-за чего поломки замечают через неделю.
+Ответ: `socket.create_connection((host, port), timeout=3)` в блоке `try/except OSError`. Если соединение открылось — порт слушается, если `ConnectionRefusedError` — порт закрыт, если `socket.timeout` — хост недоступен или фильтруется. Важно ставить `timeout`, иначе скрипт зависнет. На стенде я так проверял 445 на FS01 (10.10.10.20) и 53/3389 на DC01 (10.10.10.10).
+
+Что хочет услышать интервьюер: понимание TCP, таймаутов и различия между «закрыт» и «недоступен».
+
+Красный флаг: «просто пингануть» — ping проверяет ICMP, а не сервис.
+
+**Вопрос 3. Как сделать HTTP-запрос к API и разобрать ответ?**
+
+Как её задают: «Как из Python дернуть REST API и достать поле из JSON?»
+
+Ответ: `urllib.request.urlopen(url, timeout=10)` возвращает объект с `.status` и `.read()`. Дальше `json.loads(response.read())` — получаем словарь, достаём поле через `.get("key")`. Для POST — `urllib.request.Request(url, data=..., headers=..., method="POST")`. Сторонняя `requests` удобнее, но требует `pip install`; стандартная библиотека работает везде.
+
+Что хочет услышать интервьюер: понимание HTTP, JSON и того, что API — это обычный текстовый протокол поверх TCP.
+
+Красный флаг: «не знаю, я только curl использую».
+
+**Вопрос 4. Как разложить файлы по папкам в зависимости от даты?**
+
+Как её задают: «У пользователя 300 файлов на рабочем столе, надо разложить по месяцам».
+
+Ответ: `pathlib.Path(src).iterdir()` — обход файлов, `f.stat().st_mtime` — время изменения, `datetime.fromtimestamp(...).strftime("%Y-%m")` — имя папки, `shutil.move` — перемещение. Обязательно режим `--dry-run`, чтобы сначала показать, что будет сделано, и только потом двигать. На стенде я так делал `sort_by_date.py` для Петровой.
+
+Что хочет услышать интервьюер: аккуратность (dry-run), понимание `pathlib` и `shutil`, безопасность (не удалять, а перемещать).
+
+Красный флаг: «просто `os.rename` в цикле без проверок».
+
+**Вопрос 5. Как сделать скрипт удобным для коллег?**
+
+Как её задают: «Коллега будет запускать твой скрипт, что нужно сделать?»
+
+Ответ: аргументы через `argparse` с `--help`, разумные значения по умолчанию, понятные сообщения об ошибках, код возврата 0/1 через `sys.exit`, логирование через `logging` в файл, `--dry-run` для опасных операций. Плюс короткий README с примером запуска. На стенде `check_ports.py` и `availability.py` сделаны именно так.
+
+Что хочет услышать интервьюер: понимание, что скрипт — это продукт для людей, а не для тебя одного.
+
+Красный флаг: «запускать `python script.py` без аргументов и править код под каждую задачу».
 
 ## 8. Источники (официальная документация)
 
-- **docs.python.org** — «The Python Tutorial» (разделы про модули, файлы, ошибки и исключения); «pathlib — Object-oriented filesystem paths»; «socket — Low-level networking interface»; «argparse — Parser for command-line options»; «logging — Logging facility»; «csv — CSV File Reading and Writing». Поиск: `python pathlib tutorial`, `python socket create_connection example`.
-- **packaging.python.org** — Python Packaging User Guide: «Installing packages using pip and virtual environments», «Requirements File Format». Поиск: `python packaging user guide virtual environments`.
-- **pip.pypa.io** — документация pip: «User Guide», «pip freeze». Поиск: `pip freeze requirements documentation`.
-- **requests.readthedocs.io** — Requests: «Quickstart», «Advanced Usage» (таймауты, заголовки, обработка ошибок), «requests.exceptions». Поиск: `python requests quickstart timeout`.
-- **learn.microsoft.com** — раздел про Python на Windows: «Get started using Python on Windows for beginners», «Python on Windows FAQ» (лаунчер `py`, PATH). Поиск: `python on windows get started microsoft learn`.
-- **ubuntu.com** — Ubuntu Server documentation, раздел про пакеты и Python (`apt`, `python3-venv`). Поиск: `ubuntu server python venv documentation`.
-- Домашняя страница загрузки интерпретатора и лицензия: **python.org** (Python Software Foundation License — свободная, ограничений по установке на стенд нет). Поиск: `python download windows official`.
-- Стандарт про «внешне управляемое» окружение (почему `pip install` в Ubuntu блокируется): спецификация **PEP 668**, ищи `PEP 668 externally managed environment` `[ПРОВЕРИТЬ на актуальность формулировок в вашей версии Ubuntu]`.
+- **Python.org** (домен `python.org`) — раздел «The Python Tutorial», главы «Input and Output», «Errors and Exceptions», «Brief Tour of the Standard Library». Поиск: `python tutorial pathlib`, `python tutorial socket`.
+- **Python.org** — «Library Reference»: модули `pathlib`, `socket`, `urllib.request`, `json`, `argparse`, `logging`, `subprocess`, `shutil`. Поиск: `python pathlib documentation`, `python socket create_connection`.
+- **Python.org** — «Python Setup and Usage», раздел про установку на Windows. Поиск: `python windows installer add to path`.
+- **Ubuntu Documentation** (домен `ubuntu.com`) — раздел «Ubuntu Server», «Package management» (для `apt install python3-...`). Поиск: `ubuntu server python3`.
+- **VMware Workstation Documentation** (домен `vmware.com` или `techdocs.broadcom.com` после смены владельца) — раздел про `vmrun` и снапшоты. Поиск: `vmrun snapshot revertToSnapshot`. [ПРОВЕРИТЬ актуальный домен документации VMware в 2026 году.]
+- **Microsoft Learn** (домен `learn.microsoft.com`) — раздел «PowerShell» и «Windows Package Manager» (для установки Python на WIN11-CL01). Поиск: `powershell python install winget`.

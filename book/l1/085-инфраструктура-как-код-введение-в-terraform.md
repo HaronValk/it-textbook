@@ -2,491 +2,594 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-**Заявка в Service Desk:**
+Заявка в учебной системе «Вектора»:
 
-> **Пользователь:** petrova (Мария Петрова, HR)
-> **ВМ:** WIN10-CL02
-> **Что написала:** «Добрый день! Вчера ссылка http://10.10.10.30:8080 открывала тестовую страницу, сегодня браузер пишет "сайт недоступен". Мне туда резюме загружать, помогите.»
-> **Срочность:** Средняя
+> **Пользователь:** Иван Иванов, бухгалтерия
+> **ВМ:** WIN11-CL01
+> **Что написал:** «Мне для тестовой задачи нужна ещё одна папка на сетевом диске и отдельный тестовый пользователь. И коллеге Петровой тоже. Можно к обеду?»
+> **Срочность:** средняя
 
-Ты идёшь на UBU01 и видишь: контейнер с тестовой страницей живой, но слушает порт 8081, а не 8080. Кто-то «поправил конфиг руками» — и никто не помнит, кто и когда. Восстановил — через неделю та же история.
+В реальной работе такие просьбы — «сделай мне ещё одну виртуалку», «подними тестовый сервер», «добавь ещё одну папку» — приходят постоянно. И если каждый раз делать это руками через графический интерфейс, то через полгода никто не вспомнит, что именно было создано, с какими правами и почему. А когда что-то сломается, восстановить «как было» будет невозможно.
 
-Именно от этой боли лечит **Infrastructure as Code (IaC, «инфраструктура как код»)**: описание того, как должна выглядеть инфраструктура, лежит в текстовом файле в Git, а специальная программа приводит реальность к этому описанию. Terraform — самый распространённый в мире инструмент IaC.
+**Инфраструктура как код (Infrastructure as Code, IaC)** — это подход, при котором серверы, сети, папки, пользователи и права описываются в текстовых файлах, а не создаются кликами мышки. Файлы хранятся в Git, проходят ревью, версионируются. Изменение инфраструктуры = изменение файла + запуск команды.
 
-После этой главы ты будешь уметь: понимать модель «провайдер + ресурс + состояние», установить Terraform на Ubuntu, написать первый конфиг из нескольких ресурсов, безопасно прогонять `init → fmt → validate → plan → apply`, читать план изменений, находить расхождения между кодом и реальностью и объяснять на собеседовании, чем Terraform отличается от Ansible. Глубже (модули, remote state, workspaces) — это уже L2/DevOps, здесь только фундамент.
+**Terraform** — самый распространённый в мире инструмент IaC. Он читает твоё описание (файлы `.tf`), сравнивает с тем, что реально существует, и приводит реальность к описанному состоянию. Работает с сотнями провайдеров: VMware, облака (Яндекс Облако, VK Cloud), Docker, Active Directory, DNS и так далее.
+
+После этой главы ты будешь понимать: что такое провайдер, ресурс, состояние (state), план и применение; как описать инфраструктуру в `.tf`-файлах; как безопасно запустить `terraform plan` и `terraform apply`; как читать план и не сломать стенд. На стенде мы потренируемся на самом безопасном провайдере — `local` (создаёт файлы на диске), потому что он не требует ни облачных аккаунтов, ни API-ключей, ни интернета. А в разделе 4 покажу, как это же самое выглядит для реальных провайдеров (VMware, Yandex Cloud), чтобы ты понимал, куда расти.
 
 ## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-Terraform — один бинарник, написанный на Go. Никакой базы данных, никакого агента на целевых машинах не нужно. Работает по схеме «бинарник + файлы в каталоге проекта».
+Terraform — это один бинарник (написан на Go), который запускается на твоей машине. Никакого сервера Terraform нет. Он общается с «мирами» через **провайдеры** — плагины, которые скачиваются при первом запуске.
 
-Из чего он состоит:
+Схема работы:
 
-- **HCL (HashiCorp Configuration Language)** — язык описания. Файлы `*.tf` с блоками `terraform`, `provider`, `resource`, `variable`, `output`.
-- **Core** — ядро: строит граф зависимостей, вычисляет разницу между «что в коде» и «что в state», составляет план.
-- **Провайдеры (providers)** — отдельные плагины-бинарники, каждый умеет говорить с API конкретной системы: Docker, VMware vSphere, Yandex Cloud, Active Directory и т.д. Ставятся из реестра `registry.terraform.io` при `terraform init`.
-- **State (состояние)** — файл `terraform.tfstate` (по умолчанию JSON в каталоге проекта). Это «память» Terraform: какие ресурсы он уже создал и какие у них идентификаторы в реальной системе. **Без state Terraform не знает, что уже существует.**
-
-```
-   твой каталог проекта
-   ┌──────────────────────────────┐
-   │ main.tf  variables.tf        │   HCL — что должно быть
-   │ outputs.tf  terraform.tfvars │
-   └──────────────┬───────────────┘
-                  │ читает
-              ┌───▼────┐   сравнивает   ┌──────────────┐
-              │  Core  │◄──────────────►│ tfstate      │
-              │ / план │                │ что создано  │
-              └───┬────┘                └──────────────┘
-                  │ gRPC (локально)
-        ┌─────────▼─────────┐
-        │ provider docker   │  → unix:///var/run/docker.sock  (локально)
-        │ provider vsphere  │  → https://vcenter:443
-        │ provider yandex   │  → https://api.cloud.yandex.net:443
-        └───────────────────┘
+```text
+   ┌──────────────────────┐
+   │  Твои .tf-файлы      │  ← описание «как должно быть»
+   │  (main.tf и др.)     │
+   └──────────┬───────────┘
+              │ terraform plan / apply
+              ▼
+   ┌──────────────────────┐        ┌──────────────────┐
+   │  Terraform (бинарник)│◄──────►│  terraform.tfstate│
+   │  + провайдер         │        │  «что есть сейчас»│
+   └──────────┬───────────┘        └──────────────────┘
+              │ API-вызовы (HTTPS, локально — файлы)
+              ▼
+   ┌──────────────────────┐
+   │  Целевая система     │
+   │  VMware / Yandex /   │
+   │  Docker / AD / ...   │
+   └──────────────────────┘
 ```
 
-Что важно для L1:
+Ключевые понятия:
 
-- Terraform **декларативный**: ты пишешь «должен быть контейнер с именем X на порту 8080», а не «выполни шаг 1, шаг 2». Он сам решит, создать, изменить или удалить.
-- Он **не настраивает внутри** ОС: не ставит пакеты, не правит `sshd_config`. Это работа Ansible (урок 81). Классическое разделение: **Terraform — provisioning (создать), Ansible — configuration (настроить)**.
-- В модель OSI Terraform не влезает: он живёт на уровне **management plane**, выше прикладного. Его сетевой трафик — обычный HTTPS/443 (или HTTPS на 8443/9443 у некоторых API), а для Docker — локальный unix-сокет.
+- **Провайдер (provider)** — плагин, который умеет говорить с конкретной системой. Например, `hashicorp/local` (файлы на диске), `hashicorp/vsphere` (VMware vSphere), `yandex-cloud/yandex`, `kreuzwerker/docker`. Провайдеры скачиваются из реестра `registry.terraform.io` по HTTPS.
+- **Ресурс (resource)** — единица инфраструктуры: файл, виртуалка, папка, пользователь. Описывается блоком `resource "тип" "имя" { ... }`.
+- **Провайдер + ресурс** — например, `local_file` (файл), `vsphere_virtual_machine` (ВМ в vSphere), `yandex_compute_instance` (ВМ в Yandex Cloud).
+- **State (состояние)** — файл `terraform.tfstate`, где Terraform хранит, что он уже создал и с какими ID. Это его «память». Если state потерять — Terraform не узнает свои ресурсы и попытается создать их заново.
+- **План (plan)** — Terraform сравнивает `.tf`-файлы со state и с реальностью, показывает, что собирается сделать: `+ create`, `~ update`, `- destroy`.
+- **Apply** — выполняет план.
+- **Destroy** — удаляет всё, что описано в state.
+- **Идемпотентность** — повторный `apply` без изменений в `.tf` ничего не делает. Это главное свойство IaC.
 
-**Отдельно про VMware Workstation на нашем стенде.** Официального провайдера для Workstation нет: `hashicorp/vsphere` работает с vCenter/ESXi, а не с десктопным гипервизором. Поэтому ВМ стенда (DC01, FS01, WIN11-CL01…) создаются руками, как раньше, — и это нормально. Terraform подключается там, где есть API: контейнеры в Docker на UBU01, облака из урока 84, файлы конфигурации. На стенде мы будем управлять контейнером и генерировать inventory для Ansible.
+Порты и протоколы: для локального провайдера — ничего (просто файлы). Для облачных — HTTPS (443) к API провайдера. Для vSphere — HTTPS к vCenter (443). Terraform сам ничего не слушает.
 
-**Про лицензию.** В августе 2023 HashiCorp перевёл Terraform с MPL 2.0 на лицензию BUSL 1.1. Появился форк **OpenTofu** под эгидой Linux Foundation (MPL 2.0, полностью открытый). Команды у него те же — `tofu init`, `tofu plan` и т.д., синтаксис HCL совместим. Для РФ-2026 это существенно: OpenTofu — легальная и часто предпочтительная альтернатива, и упоминать его на собеседовании — плюс.
+**Где это в работе L1.** L1 сам Terraform обычно не пишет — этим занимаются DevOps и сисадмины. Но L1:
+- читает `plan` и объясняет, что изменится;
+- запускает `terraform apply` по инструкции;
+- понимает, почему «сервер пропал из Terraform» — потому что кто-то удалил его руками, и теперь state рассинхронизирован;
+- не редактирует `.tf`-файлы в одиночку, а идёт через ревью.
 
 ## 3. Аналогия из жизни
 
-Представь прораба на стройке. У него есть **чертёж** (файлы `.tf`) — что должно стоять на площадке: два дома, забор, гараж. Есть **папка приёмки** (`terraform.tfstate`) — где записано, что уже построено и под какими номерами это числится в кадастре. И есть **бригады** (провайдеры) — каждая умеет своё: одни кладут кирпич, другие тянут электричество.
+Представь, что ты собираешь шкаф из IKEA. В коробке лежит **инструкция** — это твои `.tf`-файлы. В инструкции написано: «полка A, полка B, 4 ножки, 8 винтов». Ты собираешь — это `apply`. Готовый шкаф — это твоя инфраструктура. А **чек-лист**, куда ты галочками отмечаешь, что уже прикрутил, — это `terraform.tfstate`.
 
-Прораб не «выполняет команды по списку». Он приходит на площадку, сверяет чертёж с папкой приёмки и с тем, что реально стоит, и говорит: «гараж уже есть — не трогаем; забор в чертеже сдвинули на метр — переставим; баню из чертежа убрали — снесём». Ты смотришь его смету (`terraform plan`), говоришь «согласен» — и он работает (`terraform apply`).
+Если через месяц ты решишь добавить ещё одну полку, ты не разбираешь шкаф целиком — ты открываешь инструкцию, дописываешь «полка C», смотришь, куда её вставить (это `plan`), и прикручиваешь (это `apply`). Terraform точно так же не пересоздаёт всё, а меняет только то, что изменилось.
 
-Где аналогия ломается: прораб помнит стройку сам и может разобраться без бумаг, а Terraform без state беспомощен — он честно скажет «ничего не построено» и начнёт строить второй такой же гараж поверх первого.
+Аналогия ломается в одном: в IKEA инструкция одна и та же для всех, а в Terraform файлы у каждой компании свои, и их пишут люди — с ошибками, ревью и обсуждениями в Git.
 
 ## 4. Практика и команды
 
-Все команды выполняются **на UBU01** (10.10.10.30) из каталога проекта, если не сказано иное.
+Все команды — на хосте в PowerShell (Terraform под Windows ставится как обычный `.exe`). На Linux-хосте — те же команды в bash.
 
-**1. Установка и проверка версии**
+### 4.1. Установка Terraform
 
-```bash
-# официальный apt-репозиторий HashiCorp (Ubuntu 24.04 = noble)
-wget -O- https://apt.releases.hashicorp.com/gpg | \
-  sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
-  sudo tee /etc/apt/sources.list.d/hashicorp.list
-sudo apt update && sudo apt install -y terraform
+Скачай официальный архив с `developer.hashicorp.com/terraform/downloads` (Windows amd64), распакуй `terraform.exe` в `C:\Lab\vektor\tools\terraform\` и добавь эту папку в `PATH` (или запускай по полному пути). Проверка:
+
+```powershell
 terraform version
 ```
 
+Пример вывода (версия у тебя может быть новее):
+
 ```text
-Terraform v1.x.y
-on linux_amd64
+Terraform v1.9.x
+on windows_amd64
 ```
 
-Смотрим: версия 1.x (0.12 и ниже — ancient, в вакансиях не встречается). Если apt-репозиторий недоступен — скачай zip с `releases.hashicorp.com` через браузер на хосте, распакуй и положи бинарник в `/usr/local/bin/terraform` (`sudo install -m 0755 terraform /usr/local/bin/`). Версию в ссылке не выдумывай — бери актуальную со страницы релизов. Альтернатива без HashiCorp вообще — OpenTofu (`tofu`) из репозитория `packages.opentofu.org` `[ПРОВЕРИТЬ]`.
+Если команда не находится — проблема в `PATH`. Проверь `$env:Path -split ';'`.
 
-На Windows-хосте: `winget install --id Hashicorp.Terraform -e` `[ПРОВЕРИТЬ]` или `choco install terraform -y`, затем `where.exe terraform`.
+### 4.2. `terraform init` — инициализация рабочей папки
 
-**2. `terraform init` — подготовка каталога**
-
-```bash
+```powershell
+cd C:\Lab\vektor\terraform\demo
 terraform init
 ```
+
+`init` читает `.tf`-файлы, находит провайдеры, скачивает их в скрытую папку `.terraform\` и создаёт `.terraform.lock.hcl` (фиксация версий). Запускается один раз на папку и после смены провайдеров.
+
+Пример вывода (примерно):
 
 ```text
 Initializing the backend...
 Initializing provider plugins...
-- Finding kreuzwerker/docker versions matching "~> 3.0"...
-- Installing kreuzwerker/docker v3.x.y...
-- Installed kreuzwerker/docker v3.x.y (signed by HashiCorp)
-Terraform has created a lock file .terraform.lock.hcl to record the provider
-selections it made above.
+- Installing hashicorp/local v2.5.x...
 Terraform has been successfully initialized!
 ```
 
-Что происходит: Terraform читает блок `required_providers`, качает плагины в `.terraform/` и фиксирует точные версии в `.terraform.lock.hcl`. **Lock-файл коммитят в Git**, каталог `.terraform/` — нет. `terraform init -upgrade` — обновить провайдеры до свежих версий в рамках ограничений.
+### 4.3. `terraform fmt` — форматирование
 
-**3. `terraform fmt` — форматирование кода**
-
-```bash
-terraform fmt -recursive      # отформатировать
-terraform fmt -check -recursive   # только проверить (exit code 3, если не отформатировано)
+```powershell
+terraform fmt -recursive
 ```
 
-Зачем: единый стиль, читаемые диффы в Git. Ставь в CI как проверку — как договаривались в уроке 83.
+Приводит `.tf`-файлы к каноническому стилю (отступы, выравнивание). В Git-ревью это обязательный шаг — иначе коллеги замучают.
 
-**4. `terraform validate` — синтаксис и типы**
+### 4.4. `terraform validate` — проверка синтаксиса
 
-```bash
+```powershell
 terraform validate
 ```
+
+Проверяет, что файлы синтаксически корректны и ссылки между ресурсами валидны. Не ходит в целевую систему. Пример:
 
 ```text
 Success! The configuration is valid.
 ```
 
-Проверяет только корректность HCL и типов переменных, **не** доступность API и не существование образов. Ошибку в имени аргумента поймает, недоступный Docker — нет.
+### 4.5. `terraform plan` — что изменится
 
-**5. `terraform plan` — смета изменений**
-
-```bash
-terraform plan -out=tfplan
+```powershell
+terraform plan
 ```
+
+Terraform читает `.tf`, читает `terraform.tfstate` (если есть), опрашивает провайдер и показывает diff. Пример для одного нового файла:
 
 ```text
 Terraform will perform the following actions:
 
-  # docker_container.web will be created
-  + resource "docker_container" "web" {
-      + name  = "vektor-web-test"
-      + ports { + external = 8080  + internal = 80 }
+  # local_file.hello will be created
+  + resource "local_file" "hello" {
+      + content  = "Privet, Vektor!"
+      + filename = "C:/Lab/vektor/terraform/demo/hello.txt"
+      + id       = (known after apply)
     }
 
-Plan: 2 to add, 0 to change, 0 to destroy.
-
-Saved the plan to: tfplan
+Plan: 1 to add, 0 to change, 0 to destroy.
 ```
 
-Символы: `+` создать, `~` изменить на месте, `-/+` пересоздать (destroy+create), `-` удалить. **Самое важное — последняя строка.** Всегда читай её и всегда смотри, нет ли в плане неожиданных `destroy`. Флаг `-out` сохраняет план, чтобы применить ровно то, что ты видел.
+Символы: `+` создать, `~` изменить на месте, `-/+` пересоздать (удалить и создать заново), `-` удалить. **Всегда читай план перед apply.**
 
-**6. `terraform show` — человекочитаемый план/состояние**
+### 4.6. `terraform apply` — применить
 
-```bash
-terraform show tfplan        # развернуть сохранённый план
-terraform show               # показать текущее состояние
+```powershell
+terraform apply
 ```
 
-Удобно, когда вывод `plan` длинный и уехал за пределы экрана.
+Показывает тот же план и спрашивает `Do you want to perform these actions?` — надо ввести `yes` (именно слово, не `y`). Для автоматизации — `terraform apply -auto-approve` (в боевой среде так делать нельзя, только в CI с ревью).
 
-**7. `terraform apply` — привести реальность к коду**
+### 4.7. `terraform show` и `terraform state list` — что создано
 
-```bash
-terraform apply tfplan       # применить сохранённый план, без лишних вопросов
-terraform apply              # заново показать план и спросить "Enter a value: yes"
-```
-
-```text
-docker_container.web: Creating...
-docker_container.web: Creation complete after 1s [id=3f9c...]
-Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
-
-Outputs:
-
-web_url = "http://10.10.10.30:8080"
-```
-
-`apply` без файла плана безопаснее для новичка: он ещё раз показывает дифф и требует ввести `yes`. `-auto-approve` — только в CI, где человек не сидит.
-
-**8. `terraform state` — заглянуть в память**
-
-```bash
+```powershell
+terraform show
 terraform state list
-terraform state show docker_container.web
 ```
+
+`show` показывает текущее состояние в человекочитаемом виде. `state list` — просто список адресов ресурсов:
 
 ```text
-docker_container.web
-docker_image.web
-local_file.ansible_inventory
-
-# docker_container.web:
-resource "docker_container" "web" {
-    id    = "3f9c..."
-    name  = "vektor-web-test"
-    ports { external = 8080  internal = 80 }
-}
+local_file.hello
 ```
 
-`state list` — быстрый ответ на вопрос «а что вообще Terraform считает своим?». Если ресурса тут нет, Terraform про него «не знает» и создаст дубль.
+### 4.8. `terraform destroy` — удалить всё
 
-**9. `terraform output` — вытащить значения**
-
-```bash
-terraform output
-terraform output -raw web_url
-```
-
-```text
-web_url = "http://10.10.10.30:8080"
-http://10.10.10.30:8080
-```
-
-`-raw` — без кавычек, удобно подставлять в скрипты и в ответ пользователю.
-
-**10. `terraform apply -replace` — пересоздать ресурс**
-
-```bash
-terraform apply -replace=docker_container.web
-```
-
-Старый способ — `terraform taint docker_container.web` — устарел. Нужно, когда контейнер «залип»: проще удалить и создать заново, чем чинить.
-
-**11. `terraform destroy` — снести всё из state**
-
-```bash
+```powershell
 terraform destroy
 ```
 
-```text
-Plan: 0 to add, 0 to change, 3 to destroy.
-Do you really want to destroy all resources?
-  Enter a value: yes
-Destroy complete! Resources: 3 destroyed.
+Удаляет всё, что описано в state. Тоже спрашивает `yes`. **Опасно**: если в state лежит боевая ВМ — она будет удалена.
+
+### 4.9. `terraform output` — вытащить значения
+
+Если в `.tf` объявлены `output`-блоки, их значения можно получить:
+
+```powershell
+terraform output
+terraform output -raw file_path
 ```
 
-Удаляет **только то, что в state**. Ручные ресурсы, созданные мимо Terraform, останутся.
+### 4.10. Как это выглядит для реальных провайдеров (теория)
 
-**12. Точечно убрать ресурс из-под управления**
+Для VMware vSphere (не путать с VMware Workstation — Terraform-провайдер `hashicorp/vsphere` работает с vCenter, а не с Workstation):
 
-```bash
-terraform state rm docker_container.web
+```hcl
+provider "vsphere" {
+  user                 = "adm.student@corp.vektor.lab"
+  password             = var.vsphere_password
+  vsphere_server       = "vcenter.corp.vektor.lab"
+  allow_unverified_ssl = false
+}
+
+resource "vsphere_virtual_machine" "test" {
+  name             = "test-vm"
+  resource_pool_id = data.vsphere_resource_pool.pool.id
+  datastore_id     = data.vsphere_datastore.ds.id
+  num_cpus         = 2
+  memory           = 4096
+  guest_id         = "ubuntu64Guest"
+}
 ```
 
-После этого контейнер живёт, но Terraform про него забыл. Опасно: следующий `apply` попробует создать второй. Применяй, только если точно понимаешь зачем.
+Для Yandex Cloud:
 
-**13. Быстрые проверки провайдеров**
+```hcl
+provider "yandex" {
+  cloud_id  = var.yc_cloud_id
+  folder_id = var.yc_folder_id
+  zone      = "ru-central1-a"
+}
 
-```bash
-terraform providers
-terraform console   # интерактивно поэкспериментировать с выражениями, выход — Ctrl+D
+resource "yandex_compute_instance" "vm" {
+  name        = "test-vm"
+  platform_id = "standard-v3"
+  resources {
+    cores  = 2
+    memory = 2
+  }
+  boot_disk {
+    initialize_params { image_id = var.image_id }
+  }
+  network_interface {
+    subnet_id = var.subnet_id
+  }
+}
 ```
 
-**GUI-путь:** у Terraform его нет — это CLI-инструмент. «Графический интерфейс» — это Git-репозиторий с `.tf`-файлами, а истории `plan`/`apply` смотри в веб-интерфейсе GitLab CI (урок 83) или в pull request.
+Синтаксис тот же самый, что и для `local_file`. Меняется только провайдер и набор полей. Именно поэтому Terraform универсален.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **UBU01** (10.10.10.30), Ubuntu Server 24.04, SSH работает.
-- На UBU01 установлен **Docker** из урока 82, пользователь `adm.student` (или твой sudo-пользователь) входит в группу `docker` (проверка: `docker ps` без sudo).
-- Terraform **ещё не установлен** — ставим в шаге 2.
-- DC01, FS01 и Windows-клиенты не нужны.
-- Если урока 82 у тебя не было — сначала пройди его: без Docker этот сценарий не соберётся.
+- Стенд в состоянии после L1 №84: есть WIN11-CL01, WIN10-CL02, UBU01, DC01, ASTRA01, FS01, SRV1C01, DC02, GW01, MON01, ESXI01, PVE01, WEB01, PVE02, PBS01, GIT01, HARBOR01, k8s-узлы. Домен `corp.vektor.lab` работает, DC01 — контроллер домена.
+- На хосте есть папки `C:\Lab\vektor` и `C:\Support`.
+- На хосте установлен Terraform (см. 4.1). Если нет — установи сейчас, это часть лабораторной.
+- На хосте есть Git (ставили в L1 №77) и настроен `user.name`/`user.email`.
+- Ты умеешь открывать PowerShell от имени администратора.
+
+**Почему не VMware Workstation.** Провайдер `hashicorp/vsphere` работает с vCenter, а не с Workstation. Провайдера для Workstation в официальном реестре нет. Поэтому лабораторная — на провайдере `local`: он безопасен, работает без интернета (после `init`), и на нём видно все ключевые механики Terraform (ресурс, state, plan, apply, destroy). Работа с реальными провайдерами — это та же самая последовательность команд, только с другим `.tf`-файлом.
 
 ### Снапшот
 
-В VMware Workstation: выдели UBU01 → **VM → Snapshot → Take Snapshot**, имя `before-l1-085`. На хосте в `stand-log.md` добавь строку «затронута UBU01». Снапшот делаем **при выключенной или работающей ВМ**, но лучше предварительно погасить её командой `sudo shutdown -h now` и снимать «холодный» снапшот — так предсказуемее.
+Снапшот `before-l1-085` на затрагиваемых ВМ делать не нужно: лабораторная не меняет ни одну ВМ. Она работает только на хосте в папке `C:\Lab\vektor\terraform\`. Но по правилам трека — сделай снапшот `before-l1-085` на **WIN11-CL01** и **UBU01** (на случай, если ты захочешь потом экспериментировать с провайдерами на этих машинах). Команда на хосте:
+
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-085
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-085
+```
+
+[ПРОВЕРИТЬ] синтаксис `vmrun snapshot` в твоей версии VMware Workstation — команда может отличаться (`snapshot` vs `snapshot create`).
 
 ### Шаги
 
-1. **UBU01.** Входим по SSH: `ssh adm.student@10.10.10.30`. Проверяем Docker: `docker ps`. Ожидаемо — таблица с заголовками `CONTAINER ID  IMAGE ...` и, возможно, пустой список. Ошибка `permission denied` — добавь себя в группу `docker` и перелогинься.
-2. **UBU01.** Ставим Terraform по инструкции из раздела 4 (команда 1). Ожидаемо: `terraform version` печатает `Terraform v1.x.y` и `on linux_amd64`.
-3. **UBU01.** Готовим каталог: `mkdir -p ~/tf-lab && cd ~/tf-lab`. Сразу создаём `.gitignore` (мы уже умеем вести документацию в Git, урок 77):
+1. **Создай рабочую папку и репозиторий.** На хосте в PowerShell:
 
-```text
-.terraform/
-*.tfstate
-*.tfstate.*
-terraform.tfvars
-tfplan
-crash.log
-```
+    ```powershell
+    New-Item -ItemType Directory -Force C:\Lab\vektor\terraform\demo | Out-Null
+    cd C:\Lab\vektor\terraform\demo
+    git init
+    ```
 
-Важно: `.terraform.lock.hcl` в `.gitignore` **не** добавляем — его коммитят.
+    Ожидаемо: папка создана, `git init` пишет `Initialized empty Git repository in C:/Lab/vektor/terraform/demo/.git/`.
 
-4. **UBU01.** Создаём `versions.tf`:
+2. **Создай `.gitignore`.** В этой же папке создай файл `.gitignore`:
 
-```hcl
-terraform {
-  required_version = ">= 1.6"
-  required_providers {
-    docker = {
-      source  = "kreuzwerker/docker"
-      version = "~> 3.0"
+    ```text
+    .terraform/
+    *.tfstate
+    *.tfstate.*
+    *.tfstate.backup
+    .terraform.lock.hcl
+    ```
+
+    Ожидаемо: файл появился. **Важно:** state и `.terraform/` в Git не кладём — там могут быть секреты и большие бинарники провайдеров. `.terraform.lock.hcl` в реальной практике обычно **кладут** в Git (фиксирует версии провайдеров), но для учебного демо можно игнорировать — [ПРОВЕРИТЬ] в вашей команде принято ли коммитить lock-файл.
+
+3. **Создай `main.tf`.** В папке `C:\Lab\vektor\terraform\demo` создай файл `main.tf`:
+
+    ```hcl
+    terraform {
+      required_version = ">= 1.5.0"
+      required_providers {
+        local = {
+          source  = "hashicorp/local"
+          version = "~> 2.5"
+        }
+      }
     }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.5"
+
+    resource "local_file" "hello" {
+      filename = "${path.module}/hello.txt"
+      content  = "Privet, Vektor! Eto fajl, sozdannyj Terraform.\n"
     }
-  }
-}
 
-provider "docker" {
-  host = "unix:///var/run/docker.sock"
-}
-```
+    resource "local_file" "ticket_note" {
+      filename = "${path.module}/ticket-ivanov.txt"
+      content  = "Zayavka ot Ivanova: nuzhna papka na setevom diske.\n"
+    }
 
-Версии провайдеров `[ПРОВЕРИТЬ]` на `registry.terraform.io` перед запуском — они обновляются.
+    output "hello_path" {
+      value = local_file.hello.filename
+    }
+    ```
 
-5. **UBU01.** Создаём `variables.tf`:
+    Ожидаемо: файл сохранён. Обрати внимание: `path.module` — встроенная переменная, путь к папке с модулем; `${...}` — интерполяция.
 
-```hcl
-variable "web_port" {
-  type        = number
-  description = "Внешний порт тестовой страницы на UBU01"
-  default     = 8080
-  validation {
-    condition     = var.web_port > 1024 && var.web_port < 65535
-    error_message = "Порт должен быть в диапазоне 1025-65534."
-  }
-}
+4. **Инициализируй.** В PowerShell:
 
-variable "container_name" {
-  type    = string
-  default = "vektor-web-test"
-}
-```
+    ```powershell
+    terraform init
+    ```
 
-6. **UBU01.** Создаём `main.tf`:
+    Ожидаемо (примерно): скачивание провайдера `hashicorp/local`, сообщение `Terraform has been successfully initialized!`. В папке появились `.terraform\` и `.terraform.lock.hcl`. Если интернета нет — `init` упадёт с ошибкой скачивания; тогда подключи хост к сети и повтори.
 
-```hcl
-resource "docker_image" "web" {
-  name = "nginx:alpine"
-}
+5. **Проверь синтаксис и отформатируй.**
 
-resource "docker_container" "web" {
-  name  = var.container_name
-  image = docker_image.web.image_id
+    ```powershell
+    terraform fmt
+    terraform validate
+    ```
 
-  ports {
-    internal = 80
-    external = var.web_port
-  }
+    Ожидаемо: `fmt` может ничего не вывести (файл уже отформатирован) или вывести имя изменённого файла; `validate` — `Success! The configuration is valid.`
 
-  restart = "unless-stopped"
-}
+6. **Посмотри план.**
 
-resource "local_file" "ansible_inventory" {
-  filename = "${path.module}/inventory.ini"
-  content  = <<-EOT
-    [web]
-    ubu01 ansible_host=10.10.10.30
-  EOT
-}
-```
+    ```powershell
+    terraform plan
+    ```
 
-7. **UBU01.** Создаём `outputs.tf`:
+    Ожидаемо (примерно): `Plan: 2 to add, 0 to change, 0 to destroy.` Два ресурса `local_file.hello` и `local_file.ticket_note` помечены `+`. Файлов `hello.txt` и `ticket-ivanov.txt` в папке пока **нет** — план ничего не создаёт.
 
-```hcl
-output "web_url" {
-  value = "http://10.10.10.30:${var.web_port}"
-}
-```
+7. **Примени.**
 
-8. **UBU01.** `terraform init`. Ожидаемо: скачивание двух провайдеров и строка `Terraform has been successfully initialized!`. Если `registry.terraform.io` недоступен — `[ПРОВЕРИТЬ]` зеркало провайдеров или OpenTofu; сообщи об этом одной строкой в журнале стенда.
-9. **UBU01.** `terraform fmt -recursive && terraform validate`. Ожидаемо: имена файлов, которые отформатированы (или пусто), затем `Success! The configuration is valid.`
-10. **UBU01.** `terraform plan -out=tfplan`. Ожидаемо: три ресурса к созданию, финальная строка `Plan: 3 to add, 0 to change, 0 to destroy.` и `Saved the plan to: tfplan`.
-11. **UBU01.** `terraform apply tfplan`. Ожидаемо: `Apply complete! Resources: 3 added...` и вывод `web_url = "http://10.10.10.30:8080"`.
-12. **UBU01.** Проверяем руками: `docker ps --format '{{.Names}}\t{{.Ports}}'` → `vektor-web-test  0.0.0.0:8080->80/tcp`; `cat inventory.ini` → две строки с секцией `[web]`; `curl -sI http://127.0.0.1:8080` → первая строка `HTTP/1.1 200 OK` (у nginx:alpine).
-13. **UBU01.** Меняем порт: `terraform apply -var="web_port=8081"`. Ожидаемо: `1 to change` — контейнер **пересоздаётся** (`-/+`), потому что смена порта требует замены. Затем `terraform output -raw web_url` → `http://10.10.10.30:8081`.
-14. **UBU01.** Возвращаем как было: `terraform apply -var="web_port=8080"`. Ожидаемо снова `1 to change` и рабочий `curl` на 8080.
-15. **UBU01.** `terraform destroy`. Ожидаемо: `Destroy complete! Resources: 3 destroyed.` `docker ps` пуст, `inventory.ini` исчез. Записываем результат в `stand-log.md`.
+    ```powershell
+    terraform apply
+    ```
+
+    Terraform покажет тот же план и спросит подтверждение. Введи `yes`. Ожидаемо: `Apply complete! Resources: 2 added, 0 changed, 0 destroyed.` и вывод `hello_path = "C:/Lab/vektor/terraform/demo/hello.txt"`. Проверь:
+
+    ```powershell
+    Get-ChildItem C:\Lab\vektor\terraform\demo
+    Get-Content C:\Lab\vektor\terraform\demo\hello.txt
+    ```
+
+    Ожидаемо: оба файла на месте, содержимое совпадает с `content` в `main.tf`.
+
+8. **Проверь идемпотентность.** Снова:
+
+    ```powershell
+    terraform plan
+    ```
+
+    Ожидаемо: `No changes. Your infrastructure matches the configuration.` Это ключевое свойство IaC — повторный запуск ничего не меняет.
+
+9. **Измени описание и посмотри diff.** Открой `main.tf`, поменяй `content` у `local_file.hello` на `"Privet, Vektor! Versiya 2.\n"`. Сохрани. Затем:
+
+    ```powershell
+    terraform plan
+    ```
+
+    Ожидаемо: `~ update in-place` для `local_file.hello` (Terraform покажет `-` старую строку и `+` новую), `Plan: 0 to add, 1 to change, 0 to destroy.` Применяй:
+
+    ```powershell
+    terraform apply -auto-approve
+    Get-Content C:\Lab\vektor\terraform\demo\hello.txt
+    ```
+
+    Ожидаемо: содержимое файла обновилось.
+
+10. **Посмотри state.**
+
+    ```powershell
+    terraform state list
+    terraform show
+    ```
+
+    Ожидаемо: два адреса `local_file.hello` и `local_file.ticket_note`, а `show` показывает их атрибуты (включая `id`).
+
+11. **Закоммить в Git.**
+
+    ```powershell
+    git add .gitignore main.tf
+    git commit -m "Terraform demo: two local_file resources"
+    ```
+
+    Ожидаемо: коммит создан, `git status` чистый (state и `.terraform/` не попали — их отсекает `.gitignore`).
+
+12. **Убери всё.**
+
+    ```powershell
+    terraform destroy -auto-approve
+    Get-ChildItem C:\Lab\vektor\terraform\demo
+    ```
+
+    Ожидаемо: `Destroy complete! Resources: 2 destroyed.` Файлы `hello.txt` и `ticket-ivanov.txt` удалены, `.tf`-файлы и state остались (state теперь пустой).
+
+13. **Запиши в журнал.** Открой `C:\Lab\vektor\stand-log.md` и добавь запись по разделу «Что изменилось на стенде» ниже.
 
 ### Проверка
 
-- [ ] `terraform version` на UBU01 отвечает и показывает `linux_amd64`
-- [ ] `terraform validate` возвращает `Success!`
-- [ ] `terraform state list` показывает ровно три адреса ресурсов
-- [ ] `docker ps` показывает `vektor-web-test` с портом `8080->80/tcp`
-- [ ] `curl -sI http://10.10.10.30:8080` отдаёт `HTTP/1.1 200 OK`
-- [ ] `terraform output -raw web_url` печатает `http://10.10.10.30:8080`
-- [ ] `inventory.ini` создан рядом с `.tf`-файлами и содержит секцию `[web]`
-- [ ] после `terraform destroy` в `state list` пусто, контейнера нет
-- [ ] `terraform fmt -check -recursive` проходит без ошибок
-- [ ] в `.gitignore` есть `*.tfstate`, а `.terraform.lock.hcl` не игнорируется
+- [ ] `terraform version` показывает версию 1.5 или новее.
+- [ ] В `C:\Lab\vektor\terraform\demo` есть `main.tf`, `.gitignore`, `.terraform.lock.hcl`, `.terraform\`, `terraform.tfstate`.
+- [ ] `terraform validate` возвращает `Success!`.
+- [ ] Первый `terraform plan` показывает `2 to add`.
+- [ ] После `apply` в папке есть `hello.txt` и `ticket-ivanov.txt` с ожидаемым содержимым.
+- [ ] Повторный `plan` — `No changes`.
+- [ ] После правки `content` — `plan` показывает `1 to change`.
+- [ ] `git log --oneline` содержит коммит с `main.tf`.
+- [ ] `terraform destroy` удалил оба файла, `.tf`-файлы остались.
+- [ ] В `stand-log.md` есть запись о лабораторной.
 
 ### Сломай и почини
 
-> **Пользователь:** petrova (Мария Петрова, HR)
-> **ВМ:** WIN10-CL02
-> **Что написала:** «Вчера ссылка http://10.10.10.30:8080 открывала тестовую страницу, сегодня браузер пишет "сайт недоступен". Мне туда резюме загружать.»
-> **Срочность:** Средняя
+**Заявка:**
 
-**Воспроизводим поломку.** На UBU01 в `~/tf-lab` возвращаем стенд в рабочее состояние (`terraform apply`) и «случайно» меняем порт, как в шаге 13, но **не сообщаем пользователю**: `terraform apply -var="web_port=8081"`. Снаружи сайт на 8080 перестал отвечать — ровно как в тикете.
+> **Пользователь:** Мария Петрова, HR
+> **ВМ:** WIN10-CL02 (но проблема на хосте в папке Terraform)
+> **Что написал:** «Коллега из IT сказал, что мой тестовый файл должен лежать в папке `C:\Lab\vektor\terraform\demo`, но его там нет. И ещё он говорит, что `terraform plan` показывает какие-то изменения, хотя ничего не трогали. Помогите разобраться.»
+> **Срочность:** низкая
+
+**Как воспроизвести поломку.** На хосте в папке `C:\Lab\vektor\terraform\demo` после успешного `apply` (шаг 7) удали файл `hello.txt` вручную:
+
+```powershell
+Remove-Item C:\Lab\vektor\terraform\demo\hello.txt
+```
+
+Теперь `terraform plan` покажет `1 to add` — Terraform видит, что в state ресурс есть, а в реальности файла нет, и хочет его пересоздать. Это классический **дрейф (drift)** — расхождение между state и реальностью.
 
 **Диагностика по шагам.**
 
-1. Уточняем у пользователя: ссылка та же? когда работало? ошибка «не удаётся подключиться» или «404»? Это сразу делит проблему на «порт/сеть» и «приложение».
-2. На UBU01: `ss -tlnp | grep -E '8080|8081'`. Видим, что слушается только `*:8081`. Порт 8080 никто не слушает — уже половина ответа.
-3. `docker ps` → контейнер `vektor-web-test` жив, но проброс `0.0.0.0:8081->80/tcp`. Значит, проблема не во «сайте», а в публикации порта.
-4. Проверяем, что дело не в файрволе: `sudo ufw status` (на стенде обычно `inactive`; если включён — `sudo ufw allow 8080/tcp` на стенде допустимо, в проде так делать не спешим).
-5. Идём в `~/tf-lab`: `git log --oneline -5` (если каталог в Git) и `git diff`. Видим правку `web_port`.
-6. `terraform state show docker_container.web` → `external = 8081`. Подтверждаем: изменение сделано через Terraform, а не руками.
-7. `terraform output` → `http://10.10.10.30:8081`. Расхождение с документацией для пользователей очевидно.
+1. Проверь, что файла действительно нет:
 
-**Решение.** Возвращаем код к согласованному значению: `terraform apply -var="web_port=8080"` (в правильной жизни — не через `-var` в командной строке, а коммитом в `terraform.tfvars`/Git, чтобы состояние было воспроизводимо). Проверяем: `curl -sI http://10.10.10.30:8080` → `200 OK`.
+    ```powershell
+    Test-Path C:\Lab\vektor\terraform\demo\hello.txt
+    ```
 
-**Ответ пользователю:**
+    Ожидаемо: `False`.
 
-> Мария, добрый день! Тестовая страница снова доступна: http://10.10.10.30:8080. Причина — вчера при обновлении конфигурации поменялся порт публикации сервиса, и старый адрес перестал работать. Конфигурацию вернули, ссылка прежняя. Если снова не откроется — напишите, пожалуйста, точный текст ошибки и время.
+2. Посмотри, что Terraform думает:
 
-**Закрываем заявку:** категория «Веб-сервис → недоступность», решение «откат изменения конфигурации (порт)», в комментарии — ссылка на коммит/план. Профилактика: добавить в чек-лист изменений пункт «после apply проверить URL из `terraform output` и предупредить пользователей».
+    ```powershell
+    cd C:\Lab\vektor\terraform\demo
+    terraform plan
+    ```
+
+    Ожидаемо: `Plan: 1 to add, 0 to change, 0 to destroy.` — Terraform хочет создать `local_file.hello` заново.
+
+3. Проверь, что state не пустой:
+
+    ```powershell
+    terraform state list
+    ```
+
+    Ожидаемо: `local_file.hello` и `local_file.ticket_note` в списке. Значит, state в порядке, проблема в реальности.
+
+4. Проверь, что в `main.tf` нет случайных правок (например, кто-то поменял `filename`):
+
+    ```powershell
+    git diff main.tf
+    ```
+
+    Ожидаемо: пусто (если ты закоммитил на шаге 11). Если есть diff — сначала разберись с ним.
+
+**Решение.** Привести реальность к описанному состоянию:
+
+```powershell
+terraform apply -auto-approve
+Test-Path C:\Lab\vektor\terraform\demo\hello.txt
+```
+
+Ожидаемо: `Apply complete! Resources: 1 added, 0 changed, 0 destroyed.` и `True`. Файл восстановлен.
+
+**Ответ пользователю.** «Мария, разобрались. Файл был удалён вручную, а Terraform об этом не знал — он хранит своё состояние отдельно. Мы запустили `terraform apply`, он увидел расхождение и восстановил файл. Впредь файлы, созданные Terraform, руками не удаляем — если нужно убрать, правим `.tf`-файл и запускаем `apply`.»
+
+**Закрытие заявки.** Категория: «Инфраструктура / IaC». Решение: «Дрейф state — файл удалён вручную, восстановлен через `terraform apply`». Время: 10 минут. Профилактика: в инструкции для команды добавить пункт «не редактировать ресурсы, созданные Terraform, вручную».
 
 ### Что изменилось на стенде
 
-- **UBU01 (10.10.10.30):** установлен Terraform (пакет из apt-репозитория HashiCorp либо бинарник в `/usr/local/bin`), добавлен apt-репозиторий `apt.releases.hashicorp.com`.
-- **UBU01:** каталог `~/tf-lab` — `versions.tf`, `variables.tf`, `main.tf`, `outputs.tf`, `.gitignore`, `.terraform.lock.hcl`, каталог `.terraform/`.
-- **UBU01:** в Docker работал контейнер `vektor-web-test` (образ `nginx:alpine`), порт 8080 на UBU01. После `destroy` контейнер и `inventory.ini` удалены — для следующих глав отмечаем, что Docker на UBU01 остался рабочим.
-- **DC01/FS01/Windows-клиенты:** без изменений.
-- Запись в `stand-log.md`: «Урок 85. Terraform на UBU01. Каталог ~/tf-lab. Рабочее состояние — destroy.»
+- На хосте создана папка `C:\Lab\vektor\terraform\demo` с Git-репозиторием.
+- В ней: `main.tf`, `.gitignore`, `.terraform.lock.hcl`, `.terraform\`, `terraform.tfstate` (после `destroy` — пустой state).
+- Установлен Terraform на хост (папка `C:\Lab\vektor\tools\terraform\`, добавлена в `PATH`).
+- В Git-репозитории `C:\Lab\vektor\terraform\demo` — один коммит с `main.tf` и `.gitignore`.
+- ВМ, роли, домен, пользователи, адреса — **не менялись**.
+- В `stand-log.md` добавлена запись о лабораторной.
 
 ### Откат
 
-Если что-то пошло не так (сломался Docker, `apply` удалил лишнее, Terraform качает провайдеров в бесконечность):
+1. Удалить папку `C:\Lab\vektor\terraform\demo` целиком (в ней только учебные файлы):
 
-1. Мягкий путь: `terraform destroy` в `~/tf-lab`, затем `sudo apt remove terraform`, `rm -rf ~/tf-lab` — стенд почти как был.
-2. Жёсткий путь: в VMware Workstation на UBU01 — **VM → Snapshot → Snapshot Manager**, выбрать `before-l1-085`, кнопка **Revert**. ВМ вернётся ровно к состоянию перед уроком; всё, что было сделано после, исчезнет.
-3. Если Docker после откатов «забыл» образы — это нормально, `docker pull` восстановит.
+    ```powershell
+    Remove-Item -Recurse -Force C:\Lab\vektor\terraform\demo
+    ```
+
+2. Удалить папку `C:\Lab\vektor\tools\terraform\` и убрать её из `PATH` (если не планируешь пользоваться Terraform дальше).
+3. Если делал снапшоты `before-l1-085` на WIN11-CL01 и UBU01 — откатиться к ним:
+
+    ```powershell
+    vmrun -T ws -vp "Lab#2026-vektor" revertToSnapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-085
+    vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-085
+    ```
+
+    [ПРОВЕРИТЬ] синтаксис `revertToSnapshot` в твоей версии VMware Workstation.
 
 ## 6. Ошибки новичков и безопасность
 
-- **Закоммитить `terraform.tfstate` в Git.** → В репозитории оказываются идентификаторы ресурсов и часто пароли в открытом виде; у коллег конфликтующие state. → В `.gitignore` `*.tfstate*`, а для командной работы — remote backend (S3-совместимое хранилище, GitLab-managed state). На стенде — просто не публиковать.
-- **`terraform destroy` без чтения плана.** → Снести рабочую инфраструктуру в один `yes`. → Всегда читать последнюю строку плана и список `-` перед подтверждением; в проде — только через ревью и пайплайн.
-- **Править ресурсы руками после `apply`.** → Дрейф конфигурации: реальность разошлась с кодом, следующий `apply` «неожиданно» пересоздаёт контейнер. → Правим только код, руками — никогда; дрейф лечим `terraform plan` и `-replace`.
-- **Хардкодить пароли и ключи в `.tf`.** → Секреты уезжают в Git и в state. → Переменные + секретное хранилище (Vault, GitLab CI variables), `.tfvars` — в `.gitignore`.
-- **`apply` без `-out` после «примерно такого» плана.** → Применяется не то, что ты смотрел пять минут назад. → `plan -out=tfplan` → `apply tfplan`.
-- **Удалить/потерять state при живых ресурсах.** → Terraform считает, что ничего нет, и создаёт дубли (второй контейнер, второй диск — и счёт в облаке). → Бэкап state, remote backend с версионированием; восстановление через `terraform import` (это уже L2).
-- **`init` без lock-файла у разных людей.** → У тебя провайдер v3.0, у коллеги v3.5, поведение разное. → `.terraform.lock.hcl` коммитим, `init` без `-upgrade` в обычной работе.
-- **Открыть Docker API в сеть на 2375/TCP без TLS.** → Любой в сети управляет контейнерами от root. → Только локальный unix-сокет; удалённо — 2376 с TLS-сертификатами, а в бою — через ограниченный доступ.
+1. **Коммитить `terraform.tfstate` в Git.** → В state могут быть пароли, ключи, IP-адреса; любой, у кого доступ к репозиторию, получает доступ к инфраструктуре. → Всегда `.gitignore` для `*.tfstate*`. Для командной работы — удалённый backend (S3, Yandex Object Storage, Terraform Cloud), но это уже за пределами L1.
 
-**Безопасность.** На стенде мы работаем от учебного пароля `Lab#2026-vektor` и через локальный unix-сокет Docker — это допустимо только в лаборатории. В реальной среде state-файл приравнивается к секрету (права `0600`, не в Git, шифрование в backend), а Terraform запускается под отдельной сервисной учётной записью с минимально нужными правами, а не под `adm.student`-администратором домена.
+2. **Запускать `terraform apply` без чтения плана.** → Можно случайно удалить боевую ВМ (`-/+` в плане означает пересоздание). → Всегда читай `plan` целиком, особенно строки с `-` и `-/+`.
 
-## 7. Вопросы на собеседовании (3–5 вопросов с ответами)
+3. **`terraform apply -auto-approve` в боевой среде.** → Нет паузы на подтверждение, ошибка в `.tf` применяется мгновенно. → В боевой среде `apply` только через CI с ревью и ручным подтверждением.
 
-**1. Что такое Terraform и чем он отличается от Ansible?**
+4. **Ручное изменение ресурсов, созданных Terraform.** → Дрейф state, `plan` показывает неожиданные изменения, `apply` может «откатить» ручную правку. → Всё, что описано в `.tf`, меняется только через `.tf`.
 
-Terraform — инструмент Infrastructure as Code, который описывает **целевое состояние** инфраструктуры декларативно и приводит к нему реальность, храня состояние в `tfstate`. Ansible — система управления конфигурацией: он **процедурно** проходит по задачам плейбука и настраивает то, что уже существует, обычно без постоянного state. На практике: Terraform создаёт ВМ, сети, диски, DNS-записи; Ansible ставит на созданные ВМ пакеты и правит конфиги. Их часто используют вместе.
+5. **Удаление `.terraform\` или `terraform.tfstate` «чтобы почистить».** → Terraform теряет связь с ресурсами, при следующем `apply` попытается создать их заново (конфликт имён, дубли). → State — это память Terraform, обращаться с ним аккуратно; для восстановления есть `terraform state` подкоманды.
 
-*Что хочет услышать интервьюер:* понимание «provisioning vs configuration management» и что оба живут в Git.
-*Красный флаг:* «Terraform и Ansible — одно и то же, только команды разные».
+6. **Использование `latest` версии провайдера без фиксации.** → Через месяц `init` скачает другую версию, поведение изменится. → Фиксируй версию в `required_providers` (`version = "~> 2.5"`) и коммить `.terraform.lock.hcl`.
 
-**2. Что такое state и что будет, если его потерять?**
+7. **Хранение паролей прямо в `.tf`.** → Пароль в Git, в истории, в логах. → Переменные (`variable`), `terraform.tfvars` в `.gitignore`, секреты — из vault/CI-переменных.
 
-`terraform.tfstate` — файл (по умолчанию JSON), где Terraform хранит соответствие «адрес ресурса в коде → реальный идентификатор в системе». При каждом запуске он сравнивает код, state и реальность и строит план. При потере state Terraform считает, что ничего не создано, и попытается создать всё заново — дубли ресурсов, а в облаке это ещё и деньги. Поэтому state бэкапят, кладут в remote backend с версионированием и блокировкой, а не держат на ноутбуке. Восстановление — `terraform import` по одному ресурсу.
+8. **Работа без снапшота на учебном стенде.** → `terraform destroy` снёс то, что не должен был. → Снапшот `before-<уровень>-<номер>` перед любой лабораторной, где есть `apply`/`destroy`.
 
-*Что хочет услышать интервьюер:* что state — не «кэш», а критичный артефакт, и что в нём бывают секреты.
-*Красный флаг:* «state можно удалить, Terraform всё равно разберётся».
+### Безопасность
 
-**3. Зачем `terraform plan` и зачем флаг `-out`?**
+В боевой среде **нельзя**:
+- запускать `terraform apply`/`destroy` от своего личного аккаунта без ревью — только через пайплайн с подтверждением;
+- хранить state в открытом виде в общем репозитории;
+- давать L1 права на `apply` в прод — L1 обычно имеет read-only доступ к планам и право запускать пайплайн по инструкции;
+- использовать `-auto-approve` в проде;
+- коммитить `.tfvars` с реальными паролями.
 
-`plan` — сухой прогон: показывает, что именно будет создано (`+`), изменено (`~`), пересоздано (`-/+`) или удалено (`-`). Это возможность поймать опасное изменение до применения. `-out=tfplan` сохраняет ровно этот план в файл, и `terraform apply tfplan` применяет именно его, без пересчёта — гарантия, что применено то, что проверено.
+Учебный стенд «Вектора» — исключение: пароль `Lab#2026-vektor` учебный, и в реальной работе так делать нельзя.
 
-*Что хочет услышать интервьюер:* дисциплина «сначала план, потом применение», особенно в CI.
-*Красный флаг:* «plan нужен только для красоты, apply сам всё покажет».
+## 7. Вопросы на собеседовании
 
-**4. Что такое провайдер и как Terraform с ним общается?**
+**Вопрос 1. «Что такое Terraform и зачем он нужен?»**
 
-Провайдер — отдельный плагин, реализующий API конкретной системы. Terraform скачивает его при `init` из реестра, фиксирует версию в lock-файле и общается с ним локально по gRPC, а провайдер уже ходит в API системы: Docker — через unix-сокет, vSphere и облака — по HTTPS/443. Один конфиг может использовать несколько провайдеров одновременно.
+Ответ: «Terraform — это инструмент Infrastructure as Code. Инфраструктура описывается в текстовых `.tf`-файлах, которые хранятся в Git. Terraform читает описание, сравнивает с тем, что реально существует (через state и API провайдера), и приводит реальность к описанному состоянию. Главные плюсы: версионирование, ревью, воспроизводимость, идемпотентность. На стенде я делал это на провайдере `local` — создавал файлы через `resource "local_file"`, смотрел `plan`, применял `apply`, проверял, что повторный `plan` даёт `No changes`.»
 
-*Что хочет услышать интервьюер:* что сам Terraform «не умеет» ни Docker, ни облака — всё делает провайдер.
-*Красный флаг:* «Terraform сам подключается к серверам по SSH и всё настраивает».
+**Что хочет услышать интервьюер:** понимание, что Terraform — декларативный (описываешь «что», а не «как»), и что state — ключевая часть.
 
-**5. Terraform или OpenTofu — в чём разница?**
+**Красный флаг:** «Terraform — это язык программирования» или «Terraform создаёт виртуалки в VMware Workstation» (нет, для Workstation провайдера нет).
 
-После перехода Terraform на лицензию BUSL 1.1 в 2023 году сообщество форкнуло его как OpenTofu под MPL 2.0 (Linux Foundation). Синтаксис HCL и CLI-команды совместимы (`tofu init/plan/apply`), большинство провайдеров работает. Различия — в лицензии, управлении проектом и части новых функций. Для компании это вопрос юридический и организационный, а не технический.
+**Вопрос 2. «Что такое terraform.tfstate и почему его нельзя коммитить в Git?»**
 
-*Что хочет услышать интервьюер:* что ты знаешь о лицензионной ситуации и не считаешь её «деталью».
-*Красный флаг:* «OpenTofu — пиратская копия Terraform».
+Ответ: «State — это файл, где Terraform хранит, какие ресурсы он создал и с какими ID. Без него Terraform не узнает свои ресурсы и попытается создать их заново. В state могут быть чувствительные данные: пароли, ключи, IP. Поэтому его не коммитят, а хранят в удалённом backend с ограниченным доступом. В `.gitignore` у меня `*.tfstate*`.»
+
+**Что хочет услышать интервьюер:** понимание, что state — это память Terraform, и что там могут быть секреты.
+
+**Красный флаг:** «State можно удалить, Terraform сам восстановит» — нет, не восстановит.
+
+**Вопрос 3. «Чем plan отличается от apply?»**
+
+Ответ: «`plan` — это предпросмотр: Terraform показывает, что собирается сделать (`+` создать, `~` изменить, `-` удалить, `-/+` пересоздать), но ничего не меняет. `apply` выполняет план. В боевой среде `plan` смотрят на ревью, а `apply` запускают через пайплайн с подтверждением. Я всегда читаю план перед apply — особенно строки с `-` и `-/+`.»
+
+**Что хочет услышать интервьюер:** что кандидат не запускает `apply` вслепую.
+
+**Красный флаг:** «Plan и apply — одно и то же, просто apply с подтверждением».
+
+**Вопрос 4. «Что такое дрейф (drift) и как его лечить?»**
+
+Ответ: «Дрейф — расхождение между state и реальностью. Например, кто-то удалил файл или ВМ вручную, а Terraform об этом не знает. `plan` покажет, что ресурс нужно создать заново. Лечится `terraform apply` — Terraform приведёт реальность к описанному состоянию. Если наоборот — ресурс создан вручную и не описан в `.tf`, — его нужно либо импортировать (`terraform import`), либо удалить. На стенде я воспроизводил дрейф: удалял `hello.txt` руками, `plan` показывал `1 to add`, `apply` восстанавливал файл.»
+
+**Что хочет услышать интервьюер:** понимание, что IaC требует дисциплины: всё через код.
+
+**Красный флаг:** «Дрейф — это когда Terraform сломался».
+
+**Вопрос 5. «Какие провайдеры Terraform ты знаешь?»**
+
+Ответ: «Из тех, что видел: `hashicorp/local` (файлы), `hashicorp/vsphere` (VMware vSphere через vCenter), `yandex-cloud/yandex` (Yandex Cloud), `kreuzwerker/docker` (Docker). Синтаксис одинаковый, меняется только провайдер и набор полей ресурса. Для VMware Workstation провайдера нет — Workstation не имеет API, с которым можно работать так же, как с vCenter.»
+
+**Что хочет услышать интервьюер:** что кандидат понимает разницу между Workstation и vSphere и не выдумывает несуществующие провайдеры.
+
+**Красный флаг:** «Terraform работает с VMware Workstation» — нет.
 
 ## 8. Источники (официальная документация)
 
-- **developer.hashicorp.com** — раздел **Terraform → Documentation → Terraform Language** (основы HCL, ресурсы, переменные, outputs). Поиск: `terraform language resources variables outputs`.
-- **developer.hashicorp.com** — **Terraform → CLI** (команды `init`, `plan`, `apply`, `state`, `fmt`, `validate`). Поиск: `terraform cli commands init plan apply`.
-- **developer.hashicorp.com** — **Terraform → State** (что такое state, remote backend, блокировки). Поиск: `terraform state remote backend`.
-- **registry.terraform.io** — реестр провайдеров; страницы `kreuzwerker/docker` и `hashicorp/local` с примерами и актуальными версиями. Поиск: `terraform registry docker provider kreuzwerker`.
-- **opentofu.org** — сайт и документация OpenTofu, раздел **Docs**. Поиск: `opentofu documentation getting started`.
-- **docs.docker.com** — **Engine → Security / API** (почему не открывают 2375/tcp наружу). Поиск: `docker engine api protect the daemon socket`.
-- **learn.microsoft.com** — обзор IaC в контексте Azure, полезен как общая теория. Поиск: `what is infrastructure as code microsoft learn`.
-
-Всё, что касается точных версий Terraform, провайдеров и команд установки пакетов, помечено `[ПРОВЕРИТЬ]` — сверяй на момент чтения.
+- **HashiCorp Developer** (`developer.hashicorp.com`), раздел **Terraform → Documentation → Configuration Language**. Поиск: `terraform configuration language`.
+- **HashiCorp Developer**, раздел **Terraform → Registry → Providers → hashicorp/local**. Поиск: `terraform local provider`.
+- **HashiCorp Developer**, раздел **Terraform → Documentation → State**. Поиск: `terraform state explained`.
+- **HashiCorp Developer**, раздел **Terraform → Documentation → Commands → plan / apply / destroy / state**. Поиск: `terraform plan command`.
+- **HashiCorp Developer**, раздел **Terraform → Registry → Providers → hashicorp/vsphere**. Поиск: `terraform vsphere provider`.
+- **Yandex Cloud** (`yandex.cloud`), раздел **Документация → Terraform**. Поиск: `yandex cloud terraform provider`.
+- **VMware** (`developer.vmware.com` или `techdocs.broadcom.com`), раздел про vSphere Automation SDK — для понимания, что провайдер `vsphere` работает с vCenter, а не с Workstation. Поиск: `vsphere automation sdk rest api`. [ПРОВЕРИТЬ] актуальный домен документации VMware после смены владельца.

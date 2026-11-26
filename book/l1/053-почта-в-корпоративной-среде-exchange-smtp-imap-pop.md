@@ -2,383 +2,437 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-**Заявка №1471.** Пользователь: `ivanov` (бухгалтерия). ВМ: WIN11-CL01. Что написал: «Отправил контрагенту акт сверки, мне пришло письмо "Undelivered Mail Returned to Sender" с каким-то кодом 5.7.1. Контрагент говорит, что ничего не получал. Срочно, до конца дня надо». Срочность: высокая.
+Заявка в учебную папку `C:\Support\Tickets`:
 
-Почта — это первый по частоте источник тикетов после «не работает принтер» и «не открывается папка». Причина простая: почта — единственный сервис, где сбой виден сразу двум сторонам, и обе звонят в поддержку. При этом она выглядит как чёрный ящик: пользователь нажал «Отправить», письмо куда-то ушло, а куда именно — непонятно.
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02.
+> **Что написала:** «Отправила письмо контрагенту на внешний ящик — вернулось с ошибкой, текст непонятный. И ещё: у Ивана из бухгалтерии письма от нас уходят в спам. Срочно, у нас подписание договора».
+> **Срочность:** высокая.
 
-После этой главы ты должен уметь: объяснить на пальцах путь письма от Outlook до ящика получателя; назвать порты SMTP/IMAP/POP3 и сказать, зачем их два разных для отправки; прочитать NDR (уведомление о недоставке) и перевести код ошибки на человеческий язык; проверить MX, SPF, DMARC через `nslookup`/`dig`; посмотреть очередь и логи почтового сервера; отличить «проблему у нас» от «проблемы у получателя» — и написать пользователю внятный ответ вместо «попробуйте ещё раз».
+Почта — это та тема, где L1 сталкивается с ней каждый день: «не приходит письмо», «письмо в спаме», «не могу отправить», «вложение не открывается», «ящик переполнен». В 90% случаев проблема не в «почте вообще», а в конкретном звене: неверный адрес, блокировка на стороне получателя, спам-фильтр, квота, сертификат, DNS-запись. L1 должен уметь за 5–10 минут локализовать звено и либо решить сам, либо передать L2 с готовой диагностикой.
 
-Плюс ты познакомишься с Exchange — не потому, что L1 его администрирует, а потому, что в 80% российских контор на Windows почта исторически Exchange или его облачные аналоги, и на собеседовании про это спросят.
+После этой главы ты будешь понимать, как письмо физически идёт от отправителя к получателю, чем отличаются SMTP, IMAP и POP3, зачем нужны SPF, DKIM и DMARC, как читать bounce-сообщение (письмо-отказ) и как объяснить пользователю, что происходит, не пугая его словами «релей» и «PTR».
 
-## 2. Теория «под капотом»
+Важно: в нашем стенде «Вектора» **своего почтового сервера нет** — это зафиксировано в описании стенда. Поэтому лабораторная будет про диагностику на существующих ВМ: проверка DNS-записей, работа с внешними тестовыми ящиками, разбор bounce-сообщений, проверка SMTP-соединения утилитами, которые уже есть на WIN11-CL01 и UBU01.
 
-Почта — это набор протоколов прикладного уровня (L7 модели OSI) поверх TCP. Каждый протокол отвечает за свой этап:
+## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
 
-```text
-  [Отправитель]                                                  [Получатель]
-  Outlook/Thunderbird  --- (1) --->  MTA отправителя  --- (2) --->  MTA получателя  --- (3) --->  Dovecot/MDA  --- (4) ---> Outlook
-        MUA                            Postfix/Exchange           Postfix/Exchange          хранилище ящика         MUA
-                                   (очередь, MX-поиск)          (фильтры, SPF/DKIM/DMARC)
+Почта — это набор независимых протоколов, которые работают на разных портах и решают разные задачи. Главное, что нужно усвоить: **отправка** и **получение** — это два разных протокола.
 
- (1) SMTP submission: 587 (с авторизацией) или 465 (TLS сразу)
- (2) SMTP relay:      25 — сервер-сервер, БЕЗ авторизации, только по MX
- (3) доставка в ящик: Postfix local / Exchange Store
- (4) IMAP 143/993 или POP3 110/995 — ЗАБРАТЬ почту из ящика
+```
+Отправитель (ivanov@corp.vektor.lab)
+   │
+   │ 1. MUA (клиент: Outlook, Thunderbird, веб-интерфейс)
+   │    отправляет письмо на свой сервер отправки
+   ▼
+SMTP-сервер отправки (Submission, порт 587 с STARTTLS)
+   │
+   │ 2. MTA ищет MX-запись домена получателя через DNS
+   ▼
+SMTP-сервер получателя (порт 25)
+   │
+   │ 3. Проверки: SPF, DKIM, DMARC, спам-фильтр, квоты
+   ▼
+Хранилище почты получателя (Mailbox)
+   │
+   │ 4. Получатель забирает письмо:
+   │    IMAP (143/993) — синхронизация с сервером
+   │    POP3 (110/995) — скачивание и удаление с сервера
+   ▼
+MUA получателя
 ```
 
-**Кто есть кто.** MUA (Mail User Agent) — клиент (Outlook). MTA (Mail Transfer Agent) — почтовый сервер, который передаёт письмо (Postfix, Exchange Transport). MDA (Mail Delivery Agent) — тот, кто кладёт письмо в конкретный ящик (Dovecot, `postfix/local`). Хранилище — Maildir/`/var/mail` в Linux или база Exchange (.edb).
+**Ключевые протоколы и порты:**
 
-**Как сервер находит сервер получателя.** По DNS-записи MX (Mail eXchanger) домена получателя: «письма для `contoso.ru` принимает `mx.contoso.ru`, приоритет 10». Если MX нет — отправитель попробует A-запись домена (устаревшее поведение, но всё ещё работает). Именно поэтому «у нас пропала почта с одного адреса» часто означает «у них сломалась DNS-зона».
+| Протокол | Порт | Назначение |
+|---|---|---|
+| SMTP | 25 | Передача писем между серверами (MTA↔MTA) |
+| SMTP Submission | 587 (STARTTLS) | Отправка письма клиентом на свой сервер |
+| SMTPS | 465 (implicit TLS) | Устаревший, но ещё встречается |
+| IMAP | 143 / 993 (TLS) | Синхронизация ящика, папки, флаги |
+| POP3 | 110 / 995 (TLS) | Скачивание, обычно «забрать и удалить» |
 
-**SMTP vs IMAP vs POP3 — самая частая путаница у новичков.** SMTP (`25`, `587`, `465`) — только отправка и передача между серверами. IMAP (`143`, `993`) — доступ к ящику на сервере, письма хранятся на сервере, папки синхронизируются, письмо читается с любого устройства. POP3 (`110`, `995`) — «скачать и обычно удалить с сервера», один ящик — одно устройство. В корпоративной среде стандарт — IMAP; POP3 встречается у старых конфигураций и это отдельный источник тикетов «письма пришли на домашний ноутбук, а на рабочем их нет».
+**MUA** (Mail User Agent) — почтовый клиент. **MTA** (Mail Transfer Agent) — серверный агент передачи. **MDA** (Mail Delivery Agent) — доставляет в ящик. **MX-запись** в DNS указывает, какой сервер принимает почту для домена.
 
-**Exchange.** Продукт Microsoft: транспортная служба (Transport Service) на Hub Transport / Mailbox-роли, база почтовых ящиков, свои коннекторы отправки/приёма (Send/Receive connectors) вместо `main.cf`. Управление — веб-консоль EAC (Exchange admin center) и PowerShell (Exchange Management Shell). Для L1 из Exchange важны три вещи: OWA (веб-почта `https://сервер/owa`), трассировка сообщений (message trace / `Get-MessageTrackingLog`) и очередь (`Get-Queue`). В 2026 году в РФ доступность облачных сервисов Microsoft для организаций ограничена и меняется — перед советом «переезжайте в Exchange Online» смотри актуальные условия `[ПРОВЕРИТЬ]`; легальные альтернативы — Яндекс 360, VK WorkSpace, Mail.ru для бизнеса (детали в уроке 54).
+**Exchange** — это корпоративный почтовый сервер Microsoft. В России его используют крупные компании, но с 2022 года Microsoft приостановила продажи новых лицензий в РФ, поэтому новые внедрения чаще идут на **CommuniGate Pro, MDaemon, Mailu, Zimbra, «МойОфис Почта»** или на **Яндекс 360 для бизнеса / VK WorkMail**. На L1 тебе важнее понимать протоколы, чем конкретный продукт: SMTP везде SMTP.
 
-**SPF, DKIM, DMARC — защита от подделки отправителя.** Это три DNS-записи и три проверки на стороне получателя:
+**SPF, DKIM, DMARC** — три DNS-записи, которые защищают домен от подделки:
 
-| Что | Где лежит | Что проверяет | Пример значения |
-|---|---|---|---|
-| SPF | TXT на домене | имеет ли право IP отправителя слать почту от этого домена | `v=spf1 a:mail.corp.vektor.lab -all` |
-| DKIM | TXT на `селектор._domainkey.домен` | криптоподпись письма; тело и часть заголовков не подменили | `v=DKIM1; k=rsa; p=MIIBIjAN...` |
-| DMARC | TXT на `_dmarc.домен` | что делать, если SPF/DKIM не сошлись, и куда слать отчёты | `v=DMARC1; p=none; rua=mailto:postmaster@corp.vektor.lab` |
+- **SPF** (Sender Policy Framework) — TXT-запись в DNS: «письма от моего домена имеют право отправлять только эти IP-адреса». Пример: `v=spf1 ip4:10.10.10.25 -all`.
+- **DKIM** (DomainKeys Identified Mail) — криптоподпись письма приватным ключом отправителя; публичный ключ лежит в DNS по адресу `selector._domainkey.домен`. Получатель проверяет подпись — если тело письма изменили в пути, подпись не сойдётся.
+- **DMARC** (Domain-based Message Authentication, Reporting and Conformance) — политика: «если SPF или DKIM не сошлись, что делать с письмом — ничего (`p=none`), в спам (`p=quarantine`) или отклонить (`p=reject`)». Плюс адрес для отчётов.
 
-`-all` в SPF означает «всё, что не перечислено, — не наш IP, reject». `p=none` в DMARC — режим наблюдения (ничего не блокируем, только собираем отчёты), `p=quarantine` — в спам, `p=reject` — отклонять. Результаты проверок получатель пишет в заголовки письма: `Authentication-Results: spf=pass dkim=pass dmarc=pass`. Отсюда правило L1: **прежде чем звонить в чужую поддержку, посмотри заголовки письма**. Если там `spf=fail` — проблема на нашей стороне, а не у них.
+**Bounce** — письмо-отказ от сервера получателя. В нём всегда есть **DSN-код** (Delivery Status Notification): например, `550 5.1.1` — «адресат не существует», `554 5.7.1` — «отклонено по политике (спам)», `452 4.2.2` — «ящик переполнен». L1 обязан уметь читать эти коды — это половина диагностики.
 
 ## 3. Аналогия из жизни
 
-Корпоративная почта — это городская почтовая сеть. `ivanov` пишет письмо и опускает в ящик у себя в отделении (SMTP submission, порт 587 — «окошко приёма с авторизацией»: без паспорта не примут). Сортировочный центр (MTA) смотрит в справочник (DNS, запись MX): «письма в город Петровск принимает вот это отделение». Дальше письмо едет поездом между сортировочными центрами (SMTP relay, порт 25 — «служебный канал между отделениями», частным лицам туда нельзя). В Петровске письмо кладут в абонементный ящик № petrova (MDA). Петрова приходит и забирает — либо сама ходит за корреспонденцией в отделение и видит все ящики и папки (IMAP), либо почтальон приносит ей домой всю пачку и оставляет расписку (POP3).
+Почта — это обычная бумажная почта, только быстрая.
 
-SPF — это список «кто имеет право отправлять письма от имени нашего города». DKIM — сургучная печать на конверте: если её вскрыли в пути, получатель это увидит. DMARC — инструкция на конверте: «если печати нет или отправитель не из списка — выбрось в мусор и напиши нам отчёт». Аналогия перестаёт работать в одном месте: у письма нет «оригинального» экземпляра — получатель видит только копию, и если копию подменили до отправки, никакая печать этого не покажет.
+**SMTP** — это курьер, который забирает письмо из твоего офиса и везёт на почтамт получателя. Он не хранит письма, он их только передаёт. **MX-запись** — это адрес почтамта в телефонном справочнике (DNS): «письма для компании X принимают вот здесь». **IMAP** — это абонентский ящик в почтамте: ты приходишь, открываешь его, читаешь, ставишь галочки «прочитано», и ящик остаётся на месте — можно прийти снова. **POP3** — это курьер, который привозит тебе домой всю пачку и забирает её из почтамта: у тебя дома копия, в почтамте пусто.
+
+**SPF** — это список «кто имеет право отправлять письма от имени компании»: если курьер пришёл не из этого списка, его не пускают. **DKIM** — это сургучная печать на конверте: получатель проверяет, что печать цела и принадлежит отправителю. **DMARC** — это инструкция для почтамта получателя: «если печать сломана или курьер не из списка — верни отправителю / выброси / положи в подозрительные».
+
+Аналогия перестаёт работать в одном месте: в реальной почте нельзя «подделать» печать, а в электронной — можно, если у тебя украли приватный ключ DKIM; именно поэтому ключи хранят на сервере, а не в клиенте.
 
 ## 4. Практика и команды
 
-Примеры вывода условные, но структура настоящая.
+Все команды ниже выполняются на существующих ВМ стенда: WIN11-CL01 (10.10.10.51), WIN10-CL02 (10.10.10.52), UBU01 (10.10.10.30), DC01 (10.10.10.10). Домен `corp.vektor.lab` уже развёрнут (L1 №42), DNS-зона на DC01 есть (L1 №34), клиенты в домене (L1 №44).
 
-**1. MX-запись домена.**
+### 4.1. Проверить MX-записи домена (PowerShell на WIN11-CL01)
+
 ```powershell
-# Windows
-nslookup -type=mx corp.vektor.lab
 Resolve-DnsName -Name corp.vektor.lab -Type MX
+Resolve-DnsName -Name yandex.ru -Type MX
 ```
-```bash
-# Linux (если нет dig: sudo apt install bind9-dnsutils)
-dig +short MX corp.vektor.lab
-```
-```text
-corp.vektor.lab MX preference = 10, mail exchanger = mail.corp.vektor.lab
-```
-`-type=MX` — тип записи. Смотрим: запись вообще есть? указывает на живой хост? один приоритет или несколько? Если MX пусто — внешняя почта в домен не пойдёт вообще.
 
-**2. SPF и DMARC в DNS.**
+`Resolve-DnsName` — встроенный командлет Windows. `-Type MX` запрашивает почтовые записи. Для `corp.vektor.lab` на нашем стенде MX-записи **нет** (своего почтового сервера нет) — увидишь ошибку или пустой ответ, это нормально. Для `yandex.ru` увидишь несколько MX с приоритетами (вывод примерный):
+
+```text
+Name       Type  TTL  Section  NameExchange       Preference
+----       ----  ---  -------  ------------       ----------
+yandex.ru  MX    600  Answer   mx.yandex.net      10
+```
+
+Смотреть: **Preference** — чем меньше число, тем приоритетнее сервер.
+
+### 4.2. Проверить SPF-запись (TXT)
+
 ```powershell
-nslookup -type=txt corp.vektor.lab
-nslookup -type=txt _dmarc.corp.vektor.lab
+Resolve-DnsName -Name corp.vektor.lab -Type TXT | Where-Object { $_.Strings -match 'v=spf1' }
+Resolve-DnsName -Name yandex.ru -Type TXT | Where-Object { $_.Strings -match 'v=spf1' }
 ```
-```bash
-dig +short TXT corp.vektor.lab
-dig +short TXT _dmarc.corp.vektor.lab
-```
-```text
-"v=spf1 a:mail.corp.vektor.lab -all"
-"v=DMARC1; p=none; rua=mailto:postmaster@corp.vektor.lab"
-```
-Ключевое: SPF должен быть **один** (два SPF-файла = fail по RFC 7208). Ищем `-all` / `~all` и понимаем политику.
 
-**3. DKIM-запись по селектору.**
-```bash
-dig +short TXT mail._domainkey.corp.vektor.lab
-```
-```text
-"v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A..."
-```
-Селектор (`mail.`) задаётся на почтовом сервере; если в письме `s=mail`, а записи нет — `dkim=none/fail`.
+SPF всегда лежит в TXT. Смотреть: начинается ли строка с `v=spf1`, какие механизмы (`ip4:`, `include:`, `a`, `mx`), чем заканчивается (`-all` — жёсткий запрет, `~all` — мягкий, `?all` — нейтрально).
 
-**4. Проверка доступности портов почты.**
+### 4.3. Проверить DKIM-запись
+
 ```powershell
-Test-NetConnection -ComputerName 10.10.10.30 -Port 25
-Test-NetConnection -ComputerName 10.10.10.30 -Port 143
+Resolve-DnsName -Name "selector1._domainkey.yandex.ru" -Type TXT
 ```
-```bash
-nc -vz 10.10.10.30 25
-nc -vz 10.10.10.30 143
-```
-```text
-Connection to 10.10.10.30 25 port [tcp/smtp] succeeded!
-```
-`-vz` — verbose, только проверка соединения без передачи данных. «Succeeded» — сеть и порт в порядке, проблема выше (авторизация, конфиг, отказ по политике).
 
-**5. Живой SMTP-диалог (проверяем, что сервер вообще отвечает и что за баннер).**
-```bash
-openssl s_client -starttls smtp -connect 10.10.10.30:25 -quiet
-```
-```text
-220 mail.corp.vektor.lab ESMTP Postfix (Ubuntu)
-EHLO test.local
-250-mail.corp.vektor.lab
-250-SIZE 10240000
-250 STARTTLS
-...
-```
-`-starttls smtp` — поднять TLS внутри SMTP-сессии. По баннеру и списку `250-` видно версию сервера и какие расширения (STARTTLS, AUTH) он предлагает.
+`selector1` — пример селектора; у каждого провайдера свой (`mail`, `default`, `google` и т.д.). Смотреть: есть ли `v=DKIM1; k=rsa; p=...` — длинная base64-строка публичного ключа.
 
-**6. Тестовое письмо в обход Outlook.**
-```bash
-sudo apt install swaks          # если не установлен
-swaks --to petrova@corp.vektor.lab --from ivanov@corp.vektor.lab --server 10.10.10.30
-```
-Отправляет письмо по SMTP напрямую. Это главный трюк L1: **если через swaks письмо доходит, а через Outlook нет — проблема в клиенте, а не в сервере**.
+### 4.4. Проверить DMARC-запись
 
-**7. Очередь сообщений Postfix.**
-```bash
-postqueue -p        # то же, что mailq
-sudo postqueue -f   # принудительно отправить всё из очереди
-```
-```text
--Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------
-A1B2C3D4E5*     512 Mon Mar  2 10:11:12  ivanov@corp.vektor.lab
-                                         petrova@corp.vektor.lab (connect to 10.10.10.30[10.10.10.30]:25: ...)
-```
-`*` — письмо в процессе отправки, без `*` — лежит и ждёт. В скобках Postfix пишет причину задержки. Пустая очередь = письма ушли дальше.
-
-**8. Логи почтового сервера.**
-```bash
-sudo tail -f /var/log/mail.log
-sudo journalctl -t postfix/smtpd -n 50 --no-pager
-```
-```text
-Mar  2 10:11:12 mail postfix/smtpd[2211]: connect from unknown[10.10.10.101]
-Mar  2 10:11:12 mail postfix/smtpd[2211]: NOQUEUE: reject: RCPT from unknown[10.10.10.101]: 554 5.7.1 <petrova@corp.vektor.lab>: Relay access denied; from:<ivanov@corp.vektor.lab>
-Mar  2 10:11:13 mail postfix/local[2213]: 9F2A: to=<petrova@corp.vektor.lab>, relay=local, status=sent
-```
-`status=sent` — доставлено в ящик, `status=bounced` / `deferred` — нет. `NOQUEUE: reject` — сервер отказал ещё до постановки в очередь, письмо не ушло никуда.
-
-**9. Конфиг Postfix «как есть» и проверка синтаксиса.**
-```bash
-postconf -n
-postfix check
-```
-```text
-mydestination = $myhostname, corp.vektor.lab, localhost, localhost.localdomain
-myhostname = mail.corp.vektor.lab
-mynetworks = 127.0.0.0/8 10.10.10.0/24
-home_mailbox = Maildir/
-```
-`-n` — только изменённые относительно дефолта параметры. В первую очередь смотрим `mydestination` (за какие домены сервер отвечает), `mynetworks` (кому разрешён relay) и `myhostname`.
-
-**10. Заголовки письма в Outlook (классический клиент).**
-Путь: открыть письмо → **Файл → Свойства → Internet headers**. Ищем строки `Received:` (путь письма, сверху вниз — от последнего сервера к первому), `Authentication-Results:` (spf/dkim/dmarc), `Return-Path`. Это то, что просят приложить к тикету.
-
-**11. Трассировка в Exchange (на нашем стенде нет — нужен Exchange).**
 ```powershell
-Get-MessageTrackingLog -Sender ivanov@corp.vektor.lab -Start (Get-Date).AddHours(-2) |
-  Format-Table Timestamp,EventId,Source,RecipientStatus
-Get-Queue
+Resolve-DnsName -Name "_dmarc.yandex.ru" -Type TXT
 ```
-`EventId` DSN/DELIVER/SEND — что произошло с письмом; `RecipientStatus` — почему не доставлено. GUI-аналог: Exchange admin center → **Mail flow → Message trace**. В Microsoft 365 — тот же Message trace в EAC.
 
-**12. Отправка из Linux-консоли, если SMTP открыт наружу (проверка анонимного relay).**
-```bash
-printf 'EHLO test\r\nMAIL FROM:<a@b.ru>\r\nRCPT TO:<test@example.com>\r\nQUIT\r\n' | nc 10.10.10.30 25
+Смотреть: `v=DMARC1; p=...; rua=mailto:...`. Если записи нет — домен не публикует политику DMARC, и получатели будут действовать по своему усмотрению.
+
+### 4.5. Проверить, что SMTP-порт получателя открыт (PowerShell)
+
+```powershell
+Test-NetConnection -ComputerName mx.yandex.net -Port 25
+Test-NetConnection -ComputerName smtp.yandex.ru -Port 587
 ```
-Если сервер принял `RCPT TO` на чужой домен — он **открытый relay**. В нормальной среде так быть не должно.
+
+`Test-NetConnection` — встроенный командлет. Смотреть: `TcpTestSucceeded : True`. Если `False` — либо у получателя порт закрыт, либо у тебя исходящий 25 заблокирован провайдером (частая история в РФ: домашние провайдеры режут 25-й порт).
+
+### 4.6. Проверить SMTP-соединение вручную (PowerShell)
+
+```powershell
+$tcp = New-Object System.Net.Sockets.TcpClient
+$tcp.Connect("mx.yandex.net", 25)
+$stream = $tcp.GetStream()
+$reader = New-Object System.IO.StreamReader($stream)
+$writer = New-Object System.IO.StreamWriter($stream)
+$writer.AutoFlush = $true
+$reader.ReadLine()          # приветствие сервера, например: 220 mx.yandex.net ESMTP
+$writer.WriteLine("EHLO win11-cl01.corp.vektor.lab")
+$reader.ReadLine()          # 250-mx.yandex.net
+$writer.WriteLine("QUIT")
+$tcp.Close()
+```
+
+Смотреть: код `220` в приветствии и `250` в ответ на EHLO. Если получил `554` или `421` — сервер отказывает, читай текст.
+
+### 4.7. Проверить обратную DNS-запись (PTR) — на UBU01
+
+```bash
+sudo apt install -y dnsutils
+dig -x 10.10.10.25
+dig MX yandex.ru +short
+dig TXT yandex.ru +short | grep spf
+```
+
+`dig` — стандартная утилита DNS. `-x` — обратный запрос (PTR). `+short` — только ответ. Смотреть: для публичных IP PTR должен совпадать с именем, которое сервер называет в EHLO, иначе многие получатели отклонят письмо как спам.
+
+### 4.8. Проверить, что DNS-клиент на WIN10-CL02 смотрит на DC01
+
+```powershell
+Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses -ne $null }
+```
+
+Смотреть: `ServerAddresses` должен содержать `10.10.10.10`. Если там что-то другое — все почтовые проверки будут врать.
+
+### 4.9. Прочитать bounce-сообщение (GUI)
+
+В Outlook / Thunderbird / веб-клиенте открой письмо-отказ. Смотри три вещи:
+1. **DSN-код** в теме или теле: `550 5.1.1`, `554 5.7.1`, `452 4.2.2`.
+2. **Строку `Diagnostic-Code:`** в заголовках (в Outlook: File → Properties → Internet headers).
+3. **Кто вернул письмо**: сервер отправителя (не смог доставить) или сервер получателя (отклонил по политике).
+
+### 4.10. Проверить квоту ящика (GUI, если есть веб-клиент)
+
+В веб-клиенте: Настройки → Ящик / Хранилище. Если занято >90% — пользователь не получит новые письма, сервер вернёт отправителю `452 4.2.2`.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
-- **DC01** (10.10.10.10): AD DS + DNS установлены, зона `corp.vektor.lab` есть, ты умеешь входить как `VEKTOR\adm.student`.
-- **UBU01** (10.10.10.30, Ubuntu Server 24.04): доступ по SSH, интернет для `apt` (или локальное зеркало). На стенде **отдельной почтовой ВМ нет** — поэтому почтовую роль (Postfix + Dovecot) поднимаем прямо на UBU01. В реальной компании под это дают отдельный сервер; здесь мы сознательно смешиваем роли.
-- **WIN11-CL01**: введён в домен, вход `VEKTOR\ivanov`, установлен классический Outlook (из урока 52), открывается.
-- **Exchange мы не устанавливаем**: для него нужна лицензия и отдельная тема уровня L2. Команды из п.4.11 и таблицу NDR отрабатываем «на бумаге» по реальным ошибкам, которые гуглятся и показываются на собеседовании.
-- Если домен ещё не поднят — сначала пройди модуль Active Directory, без DNS-зоны почта работать не будет.
+
+- WIN11-CL01 (10.10.10.51, DHCP с L1 №33, в домене с L1 №44) — рабочее место ivanov.
+- WIN10-CL02 (10.10.10.52, DHCP, в домене) — рабочее место petrova.
+- DC01 (10.10.10.10) — AD DS, DNS-зона `corp.vektor.lab` (AD-интегрированная с L1 №42), форвардер `77.88.8.8`.
+- UBU01 (10.10.10.30) — Ubuntu Server 24.04, SSH, `adm.student`.
+- Своего почтового сервера в стенде **нет** — работаем с внешними тестовыми ящиками (например, два бесплатных ящика на mail.ru и yandex.ru, созданных для учёбы) и с публичными DNS-записями.
+- На хосте есть папка `C:\Support\Tickets` для заявок.
 
 ### Снапшот
-В VMware Workstation на **всех трёх** ВМ (DC01, UBU01, WIN11-CL01): правый клик по ВМ → **Snapshot → Take Snapshot** → имя `before-l1-053`. Для выключенной ВМ снапшот тоже снимается, но лучше с остановленными сервисами. Если нужна консоль — `vmrun snapshot "<путь к .vmx>" before-l1-053`.
+
+В VMware Workstation на каждой затрагиваемой ВМ (WIN11-CL01, WIN10-CL02, DC01, UBU01) сделай снапшот с именем `before-l1-053`. WIN11-CL01 зашифрована (vTPM), поэтому через `vmrun`:
+
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-053
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-053
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-053
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-053
+```
+
+[ПРОВЕРИТЬ синтаксис `-vp` в твоей версии VMware Workstation]
 
 ### Шаги
 
-1. **UBU01.** Устанавливаем пакеты:
-   ```bash
-   sudo apt update
-   sudo apt install -y postfix dovecot-imapd dovecot-pop3d
-   ```
-   В диалоге Postfix выбираем **Internet Site**, System mail name: `mail.corp.vektor.lab`. Ожидаемо: пакеты установлены, `systemctl status postfix` — `active (running)`.
-
-2. **UBU01.** Создаём «ящики» — локальных пользователей (упрощение: в реальной компании ящики берутся из AD, а не из `/etc/passwd`):
-   ```bash
-   sudo useradd -m -s /bin/bash ivanov
-   sudo useradd -m -s /bin/bash petrova
-   echo 'ivanov:Lab#2026-vektor' | sudo chpasswd
-   echo 'petrova:Lab#2026-vektor' | sudo chpasswd
-   ```
-   Ожидаемо: `id ivanov` показывает uid/gid, домашние каталоги `/home/ivanov`, `/home/petrova` созданы.
-
-3. **UBU01.** Правим `main.cf` через `postconf -e`. **Одинарные кавычки обязательны** — иначе `$myhostname` подставит shell, а не Postfix:
-   ```bash
-   sudo postconf -e 'myhostname = mail.corp.vektor.lab'
-   sudo postconf -e 'mydomain = corp.vektor.lab'
-   sudo postconf -e 'myorigin = $mydomain'
-   sudo postconf -e 'mydestination = $myhostname, corp.vektor.lab, localhost, localhost.localdomain'
-   sudo postconf -e 'inet_interfaces = all'
-   sudo postconf -e 'mynetworks = 127.0.0.0/8 10.10.10.0/24'
-   sudo postconf -e 'home_mailbox = Maildir/'
-   sudo systemctl reload postfix && postconf -n
-   ```
-   Ожидаемо: `postconf -n` выводит семь строк, `mydestination` содержит `corp.vektor.lab`.
-
-4. **UBU01.** Настраиваем Dovecot (IMAP/POP3). Для лабы отключаем TLS и разрешаем plaintext — **это небезопасно**, в боевой среде так нельзя:
-   ```bash
-   sudo sed -i 's/^ssl = .*/ssl = no/' /etc/dovecot/conf.d/10-ssl.conf
-   sudo sed -i 's/^disable_plaintext_auth = .*/disable_plaintext_auth = no/' /etc/dovecot/conf.d/10-auth.conf
-   sudo sed -i 's|^mail_location = .*|mail_location = maildir:~/Maildir|' /etc/dovecot/conf.d/10-mail.conf
-   sudo systemctl restart dovecot
-   sudo ss -lntp | grep -E ':(25|110|143)\b'
-   ```
-   Ожидаемо: слушают `:25` (master), `:143` (imap), `:110` (pop3). Если UFW включён — `sudo ufw allow 25,110,143/tcp`.
-
-5. **DC01.** DNS Manager (`dnsmgmt.msc`) → Forward Lookup Zones → `corp.vektor.lab`:
-   - New Host (A): имя `mail`, IP `10.10.10.30`.
-   - New Mail Exchanger (MX): Mail server `mail.corp.vektor.lab`, preference `10`.
-   - New Record → Text (TXT), имя пустое (корень зоны), значение `v=spf1 a:mail.corp.vektor.lab -all`.
-   - New Record → Text (TXT), имя `_dmarc`, значение `v=DMARC1; p=none; rua=mailto:postmaster@corp.vektor.lab`.
-   Ожидаемо: три новых записи видны в зоне. PowerShell-вариант (синтаксис для корня зоны уточни в справке `[ПРОВЕРИТЬ]`): `Add-DnsServerResourceRecordA -ZoneName corp.vektor.lab -Name mail -IPv4Address 10.10.10.30`.
-
-6. **WIN11-CL01.** Проверяем, что клиент видит записи:
-   ```powershell
-   Resolve-DnsName -Name corp.vektor.lab -Type MX
-   Resolve-DnsName -Name corp.vektor.lab -Type TXT
-   Test-NetConnection -ComputerName 10.10.10.30 -Port 25
-   ```
-   Ожидаемо: MX на `mail.corp.vektor.lab`, TXT со SPF, `TcpTestSucceeded : True`.
-
-7. **WIN11-CL01.** Настраиваем Outlook: **File → Add Account → Manually configure server settings → Internet E-mail**. IMAP: `mail.corp.vektor.lab`, порт `143`, шифрование **None**; SMTP: `mail.corp.vektor.lab`, порт `25`, шифрование **None**, «Outgoing server requires authentication» — **снято**. Учётка `ivanov`, пароль `Lab#2026-vektor`. Ожидаемо: Outlook создаёт профиль, папки Inbox/Drafts/Sent подтягиваются с сервера.
-
-8. **WIN11-CL01.** Отправляем письмо: `petrova@corp.vektor.lab`, тема `Проверка 053`, текст любой. Ожидаемо: письмо уходит из Outbox, ошибок нет.
-
-9. **UBU01.** Проверяем доставку:
-   ```bash
-   sudo ls -la /home/petrova/Maildir/new/
-   sudo tail -n 20 /var/log/mail.log
-   postqueue -p
-   ```
-   Ожидаемо: в `Maildir/new/` лежит файл письма; в логе `status=sent (delivered to maildir)`; `postqueue -p` → `Mail queue is empty`.
-
-10. **UBU01.** Проверяем SMTP руками и забираем письмо по IMAP:
-    ```bash
-    swaks --to ivanov@corp.vektor.lab --from petrova@corp.vektor.lab --server 10.10.10.30 --body "тест 053"
-    sudo ls /home/ivanov/Maildir/new/
+1. **На DC01** открой PowerShell от `adm.student`. Проверь, что DNS-зона `corp.vektor.lab` отвечает:
+    ```powershell
+    Resolve-DnsName -Name dc01.corp.vektor.lab
     ```
-    Ожидаемо: swaks заканчивается `250 2.0.0 Ok: queued as XXXXX`, письмо появляется в Maildir ivanov.
+    Ожидаемо: A-запись `10.10.10.10`.
 
-11. **WIN11-CL01.** В Outlook открываем письмо от petrova → **Файл → Свойства → Internet headers**, находим `Return-Path`, `Received`. Фиксируем в блокноте, сколько строк `Received` (по одной на каждый сервер, через который прошло письмо). Ожидаемо: минимум одна.
+2. **На WIN11-CL01** проверь DNS-клиент:
+    ```powershell
+    Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses -ne $null }
+    ```
+    Ожидаемо: `ServerAddresses` содержит `10.10.10.10`.
 
-12. **UBU01.** Записываем изменения в `stand-log.md`: UBU01 получил роли MTA/MDA, открыты 25/110/143, созданы пользователи; DC01 — MX, A `mail`, TXT SPF, TXT `_dmarc`.
+3. **На WIN11-CL01** проверь MX и SPF для своего домена:
+    ```powershell
+    Resolve-DnsName -Name corp.vektor.lab -Type MX
+    Resolve-DnsName -Name corp.vektor.lab -Type TXT
+    ```
+    Ожидаемо: MX-записи нет (ошибка или пусто), TXT-записей с `v=spf1` нет. Это нормальное состояние стенда — почтового сервера нет.
+
+4. **На WIN11-CL01** проверь MX, SPF, DMARC для внешнего домена:
+    ```powershell
+    Resolve-DnsName -Name yandex.ru -Type MX
+    Resolve-DnsName -Name yandex.ru -Type TXT | Where-Object { $_.Strings -match 'v=spf1' }
+    Resolve-DnsName -Name _dmarc.yandex.ru -Type TXT
+    ```
+    Ожидаемо: MX-записи есть, SPF-строка есть, DMARC-строка есть. Запиши в `stand-log.md`, что увидел (примерно, без копирования длинных строк).
+
+5. **На UBU01** установи `dnsutils` и проверь то же через `dig`:
+    ```bash
+    sudo apt update
+    sudo apt install -y dnsutils
+    dig MX yandex.ru +short
+    dig TXT yandex.ru +short | grep spf
+    dig TXT _dmarc.yandex.ru +short
+    ```
+    Ожидаемо: те же данные, что в шаге 4, но в другом формате.
+
+6. **На WIN11-CL01** проверь доступность SMTP-портов внешнего сервера:
+    ```powershell
+    Test-NetConnection -ComputerName mx.yandex.net -Port 25
+    Test-NetConnection -ComputerName smtp.yandex.ru -Port 587
+    ```
+    Ожидаемо: `TcpTestSucceeded : True` для обоих. Если для 25-го `False` — вероятно, провайдер режет порт; зафиксируй это в журнале.
+
+7. **На WIN11-CL01** установи SMTP-сессию вручную (см. п. 4.6). Ожидаемо: получишь приветствие `220 ...` и ответ `250 ...` на EHLO. Если получил `554` — запиши текст ответа.
+
+8. **На WIN11-CL01** открой свой учебный внешний ящик (например, mail.ru) в браузере, отправь письмо на второй учебный ящик (yandex.ru). В заголовках полученного письма (в веб-клиенте: «Показать оригинал» / «View source») найди строки:
+    - `Authentication-Results:` — там будет `spf=pass`, `dkim=pass`, `dmarc=pass` (или `fail`).
+    - `Received:` — цепочка серверов, через которые прошло письмо.
+    Запиши в `stand-log.md`, какие результаты увидел.
+
+9. **На WIN10-CL02** открой учебную заявку из `C:\Support\Tickets` (файл `ticket-053-bounce.txt`, создай его сам по шаблону из раздела «Сломай и почини»). Разбери bounce-сообщение по п. 4.9: выпиши DSN-код, `Diagnostic-Code`, кто вернул письмо.
+
+10. **На WIN11-CL01** проверь PTR для публичного IP (например, для `8.8.8.8`):
+    ```powershell
+    Resolve-DnsName -Name 8.8.8.8 -Type PTR
+    ```
+    Ожидаемо: `dns.google`. Это показывает, как выглядит корректный PTR — на своём стенде у нас его нет, потому что IP приватные.
+
+11. **На DC01** проверь, что форвардер работает: с WIN11-CL01 запроси внешнее имя:
+    ```powershell
+    Resolve-DnsName -Name mail.ru -Type A
+    ```
+    Ожидаемо: A-записи есть (через форвардер `77.88.8.8`).
+
+12. Запиши в `C:\Lab\vektor\stand-log.md` итог: какие DNS-записи проверил, какие порты открыты, какие результаты аутентификации увидел в заголовках письма.
 
 ### Проверка
-- [ ] На DC01 в зоне `corp.vektor.lab` есть A `mail` → 10.10.10.30, MX → `mail.corp.vektor.lab` (10), TXT SPF, TXT `_dmarc`.
-- [ ] `Resolve-DnsName -Type MX` с WIN11-CL01 возвращает `mail.corp.vektor.lab`.
-- [ ] `Test-NetConnection` на 25 и 143 — успешно.
-- [ ] Outlook `ivanov` отправляет письмо, оно доходит до ящика `petrova` (`/home/petrova/Maildir/new/` непустой).
-- [ ] `swaks` доставляет письмо с консоли.
-- [ ] `postqueue -p` показывает пустую очередь.
-- [ ] В `/var/log/mail.log` есть строки `status=sent`, нет `NOQUEUE: reject`.
-- [ ] В `stand-log.md` записаны все изменения.
+
+- [ ] На WIN11-CL01 `Get-DnsClientServerAddress` показывает `10.10.10.10`.
+- [ ] `Resolve-DnsName corp.vektor.lab -Type MX` не возвращает MX (стенд без почтового сервера).
+- [ ] `Resolve-DnsName yandex.ru -Type MX` возвращает MX-записи.
+- [ ] SPF-строка `v=spf1` найдена для `yandex.ru`.
+- [ ] DMARC-строка `v=DMARC1` найдена для `_dmarc.yandex.ru`.
+- [ ] `Test-NetConnection` до `mx.yandex.net:25` и `smtp.yandex.ru:587` — `True` (или зафиксировано, что 25 режется провайдером).
+- [ ] Ручная SMTP-сессия получила `220` и `250`.
+- [ ] В заголовках тестового письма найдена строка `Authentication-Results`.
+- [ ] Bounce-сообщение разобрано: DSN-код и `Diagnostic-Code` выписаны.
+- [ ] Запись в `stand-log.md` сделана.
 
 ### Сломай и почини
 
-> **Пользователь:** `ivanov` (бухгалтерия)
-> **ВМ:** WIN11-CL01
-> **Что написал:** «Пишу Петровой в HR — сразу приходит письмо "Undelivered Mail Returned to Sender", внутри `554 5.7.1 <petrova@corp.vektor.lab>: Relay access denied`. До обеда нужно отправить, помогите!»
-> **Срочность:** высокая
+**Заявка:**
 
-**Как воспроизвести поломку (на UBU01):**
-```bash
-sudo postconf -e 'mydestination = $myhostname, localhost, localhost.localdomain'
-sudo systemctl reload postfix
-```
-Мы убрали `corp.vektor.lab` из списка доменов, за которые сервер отвечает. Теперь Postfix считает наш домен «чужим» и отказывает в приёме.
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02.
+> **Что написала:** «Отправила письмо контрагенту на внешний ящик — вернулось с ошибкой `550 5.1.1`. Раньше всё работало, адрес тот же. Срочно».
+> **Срочность:** высокая.
 
-**Диагностика по шагам (именно в этом порядке):**
+**Как воспроизвести поломку (на стенде):**
 
-1. **Читаем NDR целиком**, не только первую строку. Код `5.7.1` = «отказано по политике/правам»; текст `Relay access denied` = «я не принимаю почту для этого домена, а пересылать чужие письма не обязан».
-2. **Определяем, кто отказал.** Смотрим в NDR: там указан наш сервер (`mail.corp.vektor.lab`) или чужой. Наш → идём внутрь. Чужой → другая ветка (SPF/blacklist/спам-политика принимающей стороны), и это уже не наша зона.
-3. **Проверяем сеть и порт** — исключаем банальности: `Test-NetConnection -ComputerName 10.10.10.30 -Port 25`. Успешно → сеть не при чём, идём дальше.
-4. **Проверяем конфиг:** `postconf -n | grep -E 'mydestination|mynetworks|myhostname'`. Видим, что в `mydestination` нет `corp.vektor.lab` — вот и причина.
-5. **Подтверждаем логом:** `sudo tail -n 50 /var/log/mail.log` →
-   ```text
-   NOQUEUE: reject: RCPT from unknown[10.10.10.101]: 554 5.7.1 <petrova@corp.vektor.lab>: Relay access denied; from:<ivanov@corp.vektor.lab> to:<petrova@corp.vektor.lab> proto=ESMTP helo=<WIN11-CL01>
-   ```
-   `NOQUEUE` = письмо даже не встало в очередь, отказ мгновенный. Совпадает с NDR — диагноз подтверждён.
-6. **Проверяем гипотезу «а раньше работало?»** — `git`/история правок нет, но в `stand-log.md` записано исходное значение `mydestination`. Возвращаем его.
-7. **Чиним:**
-   ```bash
-   sudo postconf -e 'mydestination = $myhostname, corp.vektor.lab, localhost, localhost.localdomain'
-   sudo postfix check && sudo systemctl reload postfix
-   ```
-8. **Переотправляем** письмо (из Outlook или `swaks`), убеждаемся: `250 2.0.0 Ok: queued`, в логе `status=sent`, файл в `/home/petrova/Maildir/new/`. Письмо, которое «застряло», при отказе на этапе RCPT не сохраняется — отправитель должен отослать заново; если бы оно было в очереди, помог бы `sudo postqueue -f`.
+1. На WIN10-CL02 открой учебный внешний ящик (mail.ru), отправь письмо на **несуществующий** адрес того же домена, например `nonexistent-user-2026@mail.ru`.
+2. Через 1–2 минуты придёт bounce с кодом `550 5.1.1` (или `550 5.1.1 User unknown`). Сохрани его в `C:\Support\Tickets\ticket-053-bounce.txt`.
+3. Дополнительно: на WIN11-CL01 в `C:\Support\Tickets` создай файл `ticket-053-typo.txt` с текстом «письмо не доходит до контрагента, адрес: `partner@exampel.ru`» (опечатка в домене — `exampel` вместо `example`).
+
+**Диагностика по шагам:**
+
+1. Открой bounce, прочитай DSN-код. `550 5.1.1` — «адресат не существует». Это ответ **сервера получателя**, а не нашего.
+2. Проверь адрес в заявке посимвольно. В `ticket-053-typo.txt` — опечатка в домене (`exampel` вместо `example`). В `ticket-053-bounce.txt` — несуществующий ящик.
+3. Проверь MX-запись домена получателя:
+    ```powershell
+    Resolve-DnsName -Name mail.ru -Type MX
+    ```
+    Если MX есть — сервер получателя существует, проблема в адресе.
+4. Проверь, что наш DNS работает:
+    ```powershell
+    Resolve-DnsName -Name mail.ru -Type A
+    ```
+    Если A-запись есть — DNS в порядке, проблема не у нас.
+5. Сверь адрес с тем, что пользователь реально набирал: попроси скриншот поля «Кому» или перепиши адрес из заявки.
+
+**Решение:**
+
+- В случае `ticket-053-typo.txt`: исправить домен на `example.ru` (или тот, что реально у контрагента), отправить заново.
+- В случае `ticket-053-bounce.txt`: адрес не существует, попросить у контрагента актуальный адрес.
+- Если пользователь уверен, что адрес верный — попросить контрагента проверить ящик (возможно, он удалён или переименован).
 
 **Ответ пользователю:**
-> Иван, разобрался. Письма блокировались на нашем почтовом сервере из-за ошибки в его настройках: сервер не считал домен `corp.vektor.lab` «своим» и отказывался принимать почту для внутренних адресов. Настройку исправил, проверил тестовой отправкой — Петровой письма доходят. Пожалуйста, отправьте акт ещё раз, я проконтролирую доставку.
 
-**Закрытие заявки:** категория «Почта → недоставка внутренняя», приоритет «Высокий», решение «Исправлен параметр `mydestination` в конфигурации Postfix на UBU01, выполнена проверка доставки», привязка к инциденту-причине (если настройку меняли мы — это Change с последующим разбором).
+> «Мария, добрый день. Разобрал bounce: код `550 5.1.1` означает, что почтовый сервер получателя не нашёл такой ящик. В заявке адрес был с опечаткой в домене (`exampel` вместо `example`). Исправил, отправил заново — проверьте, пожалуйста, дошло ли. Если снова вернётся — пришлите скриншот поля "Кому", сверим посимвольно с контрагентом».
+
+**Закрытие заявки:** категория «Почта → недоставка», решение «опечатка в адресе», время — 10 минут. В `stand-log.md` запиши: «Заявка 053: bounce 550 5.1.1, причина — опечатка в домене получателя, исправлено».
 
 ### Что изменилось на стенде
-- **UBU01** (10.10.10.30): установлены `postfix`, `dovecot-imapd`, `dovecot-pop3d`; сервер работает как MTA/MDA для домена `corp.vektor.lab`; открыты TCP 25, 110, 143; TLS для Dovecot **отключён** (учебное упрощение); созданы локальные пользователи `ivanov`, `petrova` с паролем стенда; почта в формате Maildir (`~/Maildir`).
-- **DC01** (10.10.10.10): в зоне `corp.vektor.lab` добавлены A `mail` → 10.10.10.30, MX `corp.vektor.lab` → `mail.corp.vektor.lab` (pref 10), TXT SPF, TXT `_dmarc` в режиме `p=none`.
-- **WIN11-CL01**: в Outlook добавлен IMAP/SMTP-профиль `ivanov@corp.vektor.lab` (сервер `mail.corp.vektor.lab`, порты 143/25, без шифрования).
-- **FS01, WIN10-CL02, ASTRA01** — не изменялись.
+
+- Новых ВМ, ролей, учёток, адресов нет.
+- На UBU01 установлен пакет `dnsutils` (утилита `dig`).
+- На WIN11-CL01 и WIN10-CL02 созданы/использованы внешние учебные ящики (вне стенда, в `stand-log.md` зафиксировать факт).
+- В `C:\Support\Tickets` появились файлы `ticket-053-bounce.txt` и `ticket-053-typo.txt`.
+- В `C:\Lab\vektor\stand-log.md` добавлена запись о проверке DNS-записей и разборе bounce.
+- Снапшоты `before-l1-053` на WIN11-CL01, WIN10-CL02, DC01, UBU01.
 
 ### Откат
-VMware Workstation → выбрать ВМ → **Snapshot Manager** → снапшот `before-l1-053` → **Revert**. Откатывать нужно **все три** ВМ (DC01, UBU01, WIN11-CL01), иначе получишь рассинхрон: Outlook настроен на сервер, которого уже нет. После откатa верни в `stand-log.md` пометку «урок 053 откачен».
+
+В VMware Workstation на каждой ВМ: правый клик → Snapshots → `before-l1-053` → Revert. Через `vmrun`:
+
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" revertToSnapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-053
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-053
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-053
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-053
+```
+
+Файлы в `C:\Support\Tickets` и `C:\Lab\vektor\stand-log.md` на хосте откат ВМ не затрагивает — их правь вручную, если нужно.
 
 ## 6. Ошибки новичков и безопасность
 
-1. **«Перезапущу сервер — вдруг поможет».** → Перезапуск Postfix/Dovecot рвёт активные IMAP-сессии у всех пользователей и не лечит причину. → Сначала `postqueue -p` и `/var/log/mail.log`, потом решение.
-2. **Путать порты отправки.** → Настраивают Outlook на 25 «с авторизацией» или на 587 без неё — почта не уходит, а иногда уходит в очередь на сутки. → 587 = submission с AUTH, 25 = сервер-сервер, 465 = TLS сразу, 993/995 = защищённый приём.
-3. **Игнорировать `Received`-заголовки.** → Начинают чинить «у нас», когда отказ пришёл с чужого сервера. → Читаем NDR и `Authentication-Results` до любых действий.
-4. **Верить пользователю на слово «письмо не дошло».** → На деле оно в «Спаме»/«Нежелательной почте» или в папке другого профиля Outlook. → Проверяем лог доставки: `status=sent` = сервер доставил, дальше вопрос к папкам клиента.
-5. **Править SPF наугад.** → Добавляют второй `v=spf1` или лишний пробел → SPF permanent error, письма начинают резаться у всех получателей. → Одна запись на домен, проверка через `dig +short TXT` и внешний валидатор.
-6. **Ставить `p=reject` в DMARC сразу.** → Отваливается вся легитимная рассылка (1С, банк, ЭДО), которая ходит через сторонний релей. → Начинают с `p=none`, смотрят отчёты `rua`, потом ужесточают.
-7. **Забыть про `mynetworks`.** → Оставили `10.10.10.0/24` и ушли домой — любой заражённый ПК в офисе рассылает спам от имени компании и домен попадает в блок-листы. → Минимально необходимые сети, обязательная авторизация на submission.
-8. **Настраивать почту в обход тикета «по-дружески».** → Изменения без следов: следующий админ не понимает, почему конфиг нестандартный. → Любая правка почтового сервера — через заявку/изменение и с записью в `stand-log.md`.
+1. **Ошибка:** сразу лезть в настройки почтового клиента пользователя, не прочитав bounce.
+   **К чему приводит:** тратишь 30 минут на «пересоздание профиля», а проблема была в опечатке в адресе.
+   **Как правильно:** сначала bounce и DSN-код, потом всё остальное.
+
+2. **Ошибка:** путать «письмо не отправляется» и «письмо не приходит».
+   **К чему приводит:** диагностируешь не то звено. Отправка — SMTP, получение — IMAP/POP3 или веб-клиент.
+   **Как правильно:** уточни у пользователя, что именно не работает: отправка, получение или и то и другое.
+
+3. **Ошибка:** считать, что «в спаме» — это проблема получателя.
+   **К чему приводит:** не проверяешь SPF/DKIM/DMARC своего домена, а зря — если они не настроены, письма будут уходить в спам у всех.
+   **Как правильно:** проверь свои DNS-записи и заголовки `Authentication-Results` в тестовом письме.
+
+4. **Ошибка:** менять MX-записи или SPF «на глаз», чтобы «починить».
+   **К чему приводит:** ломается вся почта домена, и восстановить сложно — DNS кэшируется на часы.
+   **Как правильно:** любые изменения DNS — только через L2/администратора, с предварительной проверкой на тестовом домене.
+
+5. **Ошибка:** открывать вложения из подозрительных писем «чтобы посмотреть, что там».
+   **К чему приводит:** заражение рабочей машины. Фишинг через вложения — самый частый вектор.
+   **Как правильно:** не открывать, переслать в ИБ, зафиксировать отправителя.
+
+6. **Ошибка:** использовать личный ящик для пересылки рабочих писем «чтобы быстрее».
+   **К чему приводит:** утечка корпоративных данных, нарушение 152-ФЗ (персональные данные) и внутренних политик.
+   **Как правильно:** только корпоративный ящик, только штатные средства.
+
+7. **Ошибка:** настраивать почтовый клиент по POP3, когда в компании стандарт — IMAP.
+   **К чему приводит:** письма скачиваются на одну машину и исчезают с сервера, коллеги их не видят, бэкап не работает.
+   **Как правильно:** уточни стандарт компании, обычно это IMAP.
 
 ### Безопасность
-В этой лабе мы **отключили TLS у Dovecot** и **разрешили relay всей подсети 10.10.10.0/24** — так проще, но так нельзя в бою: пароль уходит по сети открытым текстом, а любой сотрудник может отправить письмо «от лица» компании. В нормальной среде: IMAPS 993 с валидным сертификатом, submission 587 только с AUTH, `mynetworks` — только localhost, DNS-записи SPF/DKIM/DMARC настроены, а почтовый сервер не смотрит в интернет напрямую, а стоит за антиспам-шлюзом. Пароль `Lab#2026-vektor` — только для стенда: в реальной работе пароли не передаются в чатах, не хранятся в открытом виде в конфигах и меняются при компрометации.
+
+- **Пароли от почты** — только через штатные средства сброса, никогда в открытом виде в тикете или чате. В боевой среде пароль от корпоративной почты — это доступ ко всей переписке, включая договоры и персональные данные.
+- **SPF/DKIM/DMARC** — не «галочка для галочки». Если домен не защищён, злоумышленник может отправить письмо от имени компании контрагенту, и оно пройдёт все фильтры. Настройка — задача администратора почты, но L1 должен уметь проверить и сообщить.
+- **Вложения** — исполняемые файлы (`.exe`, `.scr`, `.js`, `.lnk`) и макросы в офисных документах не открывать. В боевой среде это нарушение политики ИБ.
+- **Пересылка на личный ящик** — запрещена почти везде. Даже «одно письмо» — это утечка.
 
 ## 7. Вопросы на собеседовании
 
-**1. Пользователь говорит: «Письмо не отправилось». Твои действия?**
-Ответ: сначала прошу скриншот/текст ошибки (NDR) — код ошибки определяет всю дальнейшую ветку. Дальше проверяю: интернет и доступность почтового сервера (`Test-NetConnection` на 587/25), не заполнен ли ящик, размер вложения, статус в Outlook (`Outbox`/`Отправленные`), затем — по логам сервера, дошло ли письмо. Если NDR с нашего сервера — смотрю `/var/log/mail.log` или `Get-MessageTrackingLog`, если с чужого — читаю причину у них (SPF, blocklist, «user unknown»).
-*Что хочет услышать интервьюер:* порядок «симптом → код ошибки → проверка сети → логи сервера → ответ пользователю», и что ты не меняешь конфиг до диагноза.
-*Красный флаг:* «перезагружу почтовый сервер» или «попробуйте ещё раз» без единого вопроса.
+**Вопрос 1. «Пользователь говорит: письмо не доходит. С чего начнёте?»**
 
-**2. Чем SMTP отличается от IMAP и POP3?**
-Ответ: SMTP — транспорт, отправка и передача между серверами (25 — relay между серверами, 587 — отправка клиентом с авторизацией, 465 — TLS сразу). IMAP (143/993) — доступ к ящику, письма хранятся на сервере и синхронизируются между устройствами. POP3 (110/995) — скачивание с сервера, обычно с удалением, ящик привязан к одному устройству. В компании стандарт — IMAP; POP3 даёт классический тикет «письма есть на ноутбуке, но нет на рабочем ПК».
-*Что хочет услышать интервьюер:* что ты различаешь транспорт и доступ и знаешь номера портов.
-*Красный флаг:* «POP3 — это старый IMAP» без понимания, где хранятся письма.
+Ответ: «Уточню, что именно не работает — отправка или получение. Попрошу bounce-сообщение, если оно есть, и прочитаю DSN-код: `550 5.1.1` — адресат не существует, `554 5.7.1` — отклонено по политике (спам), `452 4.2.2` — переполнен ящик. Проверю адрес посимвольно. Если bounce нет — проверю MX-запись домена получателя через `Resolve-DnsName`, доступность SMTP-порта через `Test-NetConnection`. На стенде я это отрабатывал на внешних тестовых ящиках».
 
-**3. Что такое SPF, DKIM и DMARC и зачем они нужны?**
-Ответ: три DNS-механизма против подделки отправителя. SPF — TXT-запись со списком IP/хостов, которым разрешено слать почту от домена; `-all` запрещает всё остальное. DKIM — криптоподпись письма, публичный ключ лежит в TXT на `селектор._domainkey.домен`, получатель проверяет, что письмо не подменили. DMARC — политика на `_dmarc`: что делать при провале SPF/DKIM (`none`/`quarantine`/`reject`) и куда слать отчёты (`rua`). Результаты видны в заголовке `Authentication-Results`.
-*Что хочет услышать интервьюер:* что SPF проверяет IP, DKIM — подпись, DMARC — сводит их вместе и задаёт политику; что DMARC вводится постепенно.
-*Красный флаг:* «SPF — это антивирус/шифрование».
+Что хочет услышать интервьюер: системный подход, знание DSN-кодов, умение читать bounce.
 
-**4. Письмо вернулось с кодом 550 5.1.1. Что это значит?**
-Ответ: 5.х.х — постоянная ошибка (в отличие от 4.х.х, временной). `5.1.1` — «такого получателя на сервере нет»: опечатка в адресе, уволенный сотрудник, удалённый ящик. Проверяю адрес, смотрю, есть ли такой получатель в AD (`Get-ADUser`), если внешний — прошу отправителя уточнить адрес у контрагента. Своими силами «доставить» это письмо нельзя.
-*Что хочет услышать интервьюер:* различие 4xx/5xx и понимание, что 5.1.1 решается на стороне адреса, а не «настройкой Outlook».
-*Красный флаг:* «добавлю адрес в белый список» — белый список не создаёт несуществующий ящик.
+Красный флаг: «Переустановлю Outlook» или «Позвоню в поддержку почтового провайдера» без диагностики.
 
-**5. Где смотреть, что произошло с письмом в Exchange?**
-Ответ: трассировка сообщений — Exchange admin center → Mail flow → Message trace, либо в Exchange Management Shell `Get-MessageTrackingLog` с фильтрами по отправителю/получателю и времени; состояние очереди — `Get-Queue`; заголовки письма — в Outlook через **Файл → Свойства → Internet headers**. В Microsoft 365 трассировка живёт в том же разделе EAC, ограничение по глубине хранения истории зависит от тарифа `[ПРОВЕРИТЬ]`.
-*Что хочет услышать интервьюер:* что ты знаешь инструмент трассировки и не лезешь в базы Exchange руками.
-*Красный флаг:* «пойду смотреть логи в папке Exchange» — без понимания, что это EAC/EMS.
+**Вопрос 2. «Чем SMTP отличается от IMAP и POP3?»**
+
+Ответ: «SMTP — протокол отправки, работает между серверами и от клиента к серверу, порт 25 или 587. IMAP и POP3 — протоколы получения. IMAP синхронизирует ящик: письма хранятся на сервере, папки и флаги общие для всех устройств, порт 143 или 993. POP3 скачивает письма на устройство и обычно удаляет с сервера, порт 110 или 995. В компаниях стандарт — IMAP, потому что нужен доступ с нескольких устройств и бэкап на сервере».
+
+Что хочет услышать: чёткое разделение «отправка / получение», знание портов, понимание, почему IMAP.
+
+Красный флаг: путаница «SMTP — это чтобы получать почту».
+
+**Вопрос 3. «Что такое SPF, DKIM и DMARC и зачем они нужны?»**
+
+Ответ: «Это три DNS-записи для защиты домена от подделки. SPF — TXT-запись со списком IP, которым разрешено отправлять от имени домена. DKIM — криптоподпись письма, публичный ключ в DNS по адресу `selector._domainkey.домен`. DMARC — политика: что делать, если SPF или DKIM не сошлись — ничего, в спам или отклонить. Без них письма от домена легко подделать, и получатели будут отправлять их в спам. На стенде я проверял эти записи через `Resolve-DnsName` и `dig` для внешних доменов».
+
+Что хочет услышать: понимание, что это защита от подделки, а не «настройка почтового сервера».
+
+Красный флаг: «Это настраивает провайдер, я не касаюсь».
+
+**Вопрос 4. «Пользователь жалуется, что его письма уходят в спам у получателя. Что проверите?»**
+
+Ответ: «Проверю SPF, DKIM и DMARC нашего домена — есть ли записи, корректны ли. Попрошу пользователя переслать тестовое письмо на внешний ящик и посмотрю заголовок `Authentication-Results`: если там `spf=fail` или `dkim=fail`, проблема в настройках домена, эскалирую на администратора почты. Если всё `pass` — проблема на стороне получателя, его спам-фильтр, и тут мы мало что можем сделать, кроме как попросить получателя добавить нас в белый список».
+
+Что хочет услышать: умение читать заголовки, понимание границы ответственности.
+
+Красный флаг: «Скажу пользователю, чтобы писал с другого ящика».
+
+**Вопрос 5. «Что такое bounce и какие коды вы знаете?»**
+
+Ответ: «Bounce — письмо-отказ от сервера. В нём DSN-код: `550 5.1.1` — адресат не существует, `550 5.7.1` — отклонено по политике (часто спам), `452 4.2.2` — ящик переполнен, `421` — временная ошибка, попробовать позже. Код состоит из трёх цифр: первая — класс (2xx успех, 4xx временная ошибка, 5xx постоянная), дальше детализация. Умение читать bounce — половина диагностики почты на L1».
+
+Что хочет услышать: знание классов кодов и конкретных примеров.
+
+Красный флаг: «Bounce — это когда письмо не дошло, а почему — не знаю».
 
 ## 8. Источники (официальная документация)
 
-- **learn.microsoft.com** — раздел «Exchange Server»: статьи «Mail flow», «Message tracking», «Get-MessageTrackingLog», «Exchange admin center». Поиск: `Exchange Server message tracking site:learn.microsoft.com`.
-- **learn.microsoft.com** — «Microsoft 365 Defender / Exchange admin center message trace». Поиск: `message trace Exchange admin center`.
-- **postfix.org** — основная документация: `postconf(5)` (все параметры, в т.ч. `mydestination`, `mynetworks`), `STANDARD_CONFIGURATION_README`, `POSTSCREEN_README`, `BACKSCATTER_README`. Поиск: `postfix standard configuration readme`.
-- **dovecot.org** — «Dovecot documentation», разделы «Mail location» и «Authentication». Поиск: `dovecot maildir configuration`.
-- **rfc-editor.org** — RFC 5321 (SMTP), RFC 7208 (SPF), RFC 6376 (DKIM), RFC 7489 (DMARC). Поиск: `RFC 7208 SPF`.
-- **dmarc.org** — «Overview» и «DMARC deployment guide». Поиск: `DMARC overview deployment guide`.
-- **iana.org** — «Service Name and Transport Protocol Port Number Registry» (актуальные номера портов). Поиск: `IANA service names port registry`.
-- **ubuntu.com** — Ubuntu Server Guide, раздел «Email services» (Postfix на Ubuntu 24.04). Поиск: `Ubuntu server guide postfix`.
-- Инструменты проверки (не официальная документация, но рабочие): MXToolbox, mail-tester, Google Admin Toolbox — проверка SPF/DKIM/DMARC и «спам-оценки» письма. Поиск: `SPF DKIM DMARC checker`.
+- **Microsoft Learn** (learn.microsoft.com) — раздел «Exchange Server» и статьи «Mail flow», «Accepted domains», «Connectors». Поиск: `Exchange Server mail flow`.
+- **Microsoft Learn** — «Resolve-DnsName» (PowerShell), «Test-NetConnection». Поиск: `Resolve-DnsName PowerShell`.
+- **RFC Editor** (rfc-editor.org) — RFC 5321 (SMTP), RFC 3501 (IMAP4rev1), RFC 1939 (POP3), RFC 7208 (SPF), RFC 6376 (DKIM), RFC 7489 (DMARC). Поиск: `RFC 7208 SPF`.
+- **Яндекс 360 для бизнеса** (yandex.ru/support/business) — раздел «Почта», статьи про SPF, DKIM, DMARC. Поиск: `Яндекс 360 SPF DKIM DMARC настройка`.
+- **VK WorkMail** (mail.vk.com) — справка по настройке домена и DNS-записей. Поиск: `VK WorkMail настройка домена SPF`.
+- **Mail.ru для бизнеса** (biz.mail.ru) — справка по DNS-записям. Поиск: `Mail.ru для бизнеса SPF DKIM`.
+- **CommuniGate Pro** (communigate.com) — документация по SMTP и защите от спама. Поиск: `CommuniGate Pro SMTP configuration`. [ПРОВЕРИТЬ актуальность раздела]
+- **Zimbra** (zimbra.com) — документация по MTA и DKIM. Поиск: `Zimbra DKIM setup`. [ПРОВЕРИТЬ актуальность раздела]
+- **Google Workspace Admin Help** (support.google.com/a) — статьи про SPF, DKIM, DMARC и `Authentication-Results`. Поиск: `Google Workspace email authentication SPF DKIM DMARC`.

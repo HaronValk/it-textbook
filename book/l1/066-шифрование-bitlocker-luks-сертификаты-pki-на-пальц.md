@@ -2,544 +2,482 @@
 
 ## 1. Введение (зачем это нужно в реальной работе)
 
-```
-Заявка #4127
-Пользователь: ivanov (Иван Иванов, бухгалтерия, ВМ WIN11-CL01)
-Что написал: «Добрый день! Вчера выключил компьютер, сегодня включаю —
-диск D: с архивами не открывается. Windows просит "введите пароль для
-диска". Я ничего не менял, паролей не ставил. Завтра сдавать отчётность,
-очень срочно!»
-Срочность: высокая
-```
+Заявка в учебную очередь `C:\Support\Tickets`:
 
-Это классика. Восемьдесят процентов «загадочных паролей на диске» — это BitLocker, который кто-то включил (иногда сам пользователь, иногда групповая политика, иногда прошлый админ перед выдачей ноутбука). И ровно в этот момент выясняется, что ключ восстановления никто не сохранил. Дальше — либо данные есть, либо их нет.
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02.
+> **Что написала:** «Ноутбук вчера увезла домой, сегодня утром при включении просит какой-то длинный ключ восстановления, я ничего не вводила. Работа стоит, у меня отчёт для директора.»
+> **Срочность:** Высокая.
 
-Шифрование встречается в L1 постоянно: ноутбуки с 1С и персональными данными, флешки, которые «просят пароль», корневые сертификаты для Госуслуг и ЭДО, «сайт не открывается, пишет про сертификат», ЭЦП на Rutoken, которая «перестала работать». После этой главы вы должны: понимать, чем шифрование диска отличается от шифрования файла и от TLS; уметь посмотреть статус BitLocker и вытащить/применить ключ восстановления; уметь открыть и закрыть LUKS-том в Linux и сделать бэкап заголовка; читать сертификат X.509 и объяснять, почему браузер ругается; и главное — знать, что делать **до** того, как что-то зашифровать.
+Это классика. BitLocker — штатное шифрование диска в Windows — сработал как задумано, но пользователь не понимает, что произошло, а без ключа восстановления данные не прочитать вообще. На L1 вы не «взламываете» шифрование, вы помогаете человеку найти ключ, объясняете, что случилось, и не даёте повториться. Плюс на Linux-машинах (UBU01, ASTRA01) та же задача называется LUKS, а на уровне «почему браузер доверяет сайту банка» — это сертификаты и PKI.
 
-## 2. Теория «под капотом» (как это работает: архитектура, протоколы)
+После этой главы вы будете: понимать, что именно шифруют BitLocker и LUKS и где хранятся ключи; уметь проверить статус шифрования и найти ключ восстановления; знать, что такое сертификат, удостоверяющий центр и цепочка доверия; уметь посмотреть сертификат сайта и объяснить пользователю ошибку «сертификат недействителен». Всё это — типовые L1-задачи в московских компаниях, особенно там, где работают с персональными данными и 1С.
 
-**Три состояния данных.** Любая защита информации — это защита данных в одном из трёх состояний:
+## 2. Теория «под капотом»
 
-```text
-                  ┌──────────────────────────────────────────┐
-                  │            ДАННЫЕ КОМПАНИИ               │
-                  └──────────────────────────────────────────┘
-                        │                │              │
-                 at rest (покой)   in transit     in use (в работе)
-                        │            (в пути)            │
-                        ▼                ▼                ▼
-              BitLocker / LUKS      TLS, ГОСТ TLS     права доступа,
-              (шифр диска)          (HTTPS, LDAPS)    DLP, ЭЦП
-              EFS (файл)            VPN (IPsec)
-                        │                │                │
-                        └────────────────┴────────────────┘
-                                 всё это — криптография
-```
+### Что такое шифрование диска
 
-L1 в основном сталкивается с первыми двумя. Шифрование «в покое» спасает, когда ноутбук потеряли или диск вынули и подключили к другому ПК. Шифрование «в пути» спасает, когда трафик перехватывают в кафе или в чужой сети.
+Шифрование диска превращает содержимое секторов в «мусор» без ключа. Ключ — длинная случайная строка. Пользователь его не помнит, поэтому на практике ключ защищён паролем, PIN-кодом или TPM-чипом.
 
-**Симметричное и асимметричное.** Симметричное шифрование — один и тот же ключ шифрует и расшифровывает (AES). Быстро, поэтому именно им шифруют диски и трафик. Асимметричное — два ключа, приватный и публичный (RSA, ГОСТ Р 34.10-2012): что зашифровали публичным, откроет только приватный. Медленно, поэтому им не шифруют диски — им **договариваются о симметричном ключе** и **подписывают** документы. В TLS так и есть: асимметрикой проверяют сертификат и обмениваются ключом сессии, а дальше болтают симметричным AES.
+**TPM (Trusted Platform Module)** — маленькая микросхема (или её эмуляция) на материнской плате, которая умеет хранить секреты и измерять, «не подменили ли» загрузку. На стенде WIN11-CL01 создана с виртуальным TPM (vTPM) — именно поэтому VMware шифрует её файлы, а `vmrun` для неё требует пароль шифрования.
 
-**BitLocker.** Драйвер `fvevol` (Full Volume Encryption) перехватывает обращения к секторам диска и шифрует их на лету. Ключей два уровня:
+Два уровня ключей (упрощённо):
 
 ```text
-   Пароль/PIN/TPM  ──►  VMK (Volume Master Key)  ──►  FVEK  ──►  сектора диска
-   Recovery password ──►        │                     (AES-XTS)
-   Startup key (USB) ──►        │
-        «protectors»            └─ можно перешифровать FVEK,
-                                   не меняя пароль (быстро)
-```
-
-«Protector» — это способ разблокировать VMK: TPM (микросхема, которая отдаёт секрет только «своей» системе), пароль, PIN, файл ключа на флешке, 48-значный recovery password. Recovery password есть всегда — иначе потеря TPM означала бы потерю данных. Он не «главный пароль администратора», он **равноправный** protector.
-
-**LUKS / dm-crypt (Linux).** В ядре Linux есть подсистема `dm-crypt`, которая шифрует блочное устройство. LUKS — это формат **заголовка** поверх него: в начале диска лежит структура с описанием шифра и «слотами ключей». Пароль пользователя расшифровывает ключ слота, ключ слота расшифровывает **master key**, а master key — сами данные.
-
-```text
- /dev/sdb
- ┌────────────────────────────────────────────┐
- │ LUKS2 header                                │
- │  ├ keyslot 0: AES-XTS,argon2, зашифрован    │◄── пароль №1
- │  ├ keyslot 1: ...                           │◄── пароль №2 (резерв!)
- │  └ master key (зашифрован во всех слотах)   │
- ├────────────────────────────────────────────┤
- │ ciphertext: AES-XTS-plain64, 512-bit key    │
- └────────────────────────────────────────────┘
-        │ cryptsetup open
+Пароль/PIN пользователя
+        │  (разблокирует)
         ▼
- /dev/mapper/secretdisk  ──►  файловая система ext4  ──►  /mnt
-```
-
-Важное следствие: смена пароля LUKS (`luksChangeKey`) **не перешифровывает диск**, потому что меняется только обёртка слота, а master key остаётся. И наоборот: потеря/порча заголовка = потеря данных, даже если пароль вы помните. Поэтому бэкап заголовка обязателен.
-
-**PKI и сертификаты.** PKI (Public Key Infrastructure) — это иерархия доверия. Сертификат X.509 — просто набор полей (кому выдан, кем, срок, публичный ключ), **подписанный приватным ключом удостоверяющего центра (CA)**.
-
-```text
-   Корневой CA (Root)  ← самоподписан, лежит в хранилище «Доверенные корневые»
-        │ подписывает
-        ▼
-   Промежуточный CA (Intermediate)
-        │ подписывает
-        ▼
-   Сертификат сервера/пользователя (Leaf): CN=fs01.corp.vektor.lab
+   Ключ защиты (protector)  ──► TPM, пароль, ключ восстановления
         │
         ▼
-   Клиент проверяет: подпись по цепочке до корня + срок + Key Usage
-                    + имя (SAN) + не отозван ли (CRL/OCSP)
+   Мастер-ключ шифрования (VMK / master key)
+        │
+        ▼
+   Ключ шифрования секторов (FVEK / volume key)
+        │
+        ▼
+   Зашифрованные данные на диске
 ```
 
-Порты, где это живёт: HTTPS — 443/TCP, LDAPS — 636/TCP, LDAP — 389/TCP, Kerberos — 88/TCP. По модели OSI TLS — это уровень представления/сеансовый (5–6), а шифрование диска вообще вне OSI: это слой хранения.
+Смысл: можно сменить пароль, не перешифровывая весь диск, и можно иметь несколько «запасных входов» (protectors) — TPM, пароль, ключ восстановления.
 
-В РФ отдельная ветка: ГОСТ Р 34.10-2012 (подпись) и ГОСТ Р 34.11-2012 (хеш), реализация — КриптоПро CSP, носители Rutoken/JaCarta, удостоверяющие центры (УЦ Минцифры, УЦ ФНС, коммерческие УЦ для ЭДО). Для браузера с ГОСТ-TLS нужен плагин КриптоПро (в браузерах на Chromium — «КриптоПро ЭЦП Browser plug-in») `[ПРОВЕРИТЬ актуальное название и версию]`. КриптоПро — коммерческий продукт, есть пробный период `[ПРОВЕРИТЬ срок]`; бесплатная альтернатива для учёбы — OpenSSL с ГОСТ-движком, но это уже не L1.
+### BitLocker (Windows)
+
+- Шифрует **том целиком** (обычно системный диск C:).
+- Режимы: с TPM (прозрачная разблокировка при загрузке), с TPM+PIN, с паролем, с USB-ключом.
+- **Ключ восстановления** — 48 цифр, разбитых на 8 групп по 6. Это аварийный вход, если TPM «обиделся» (сменилось железо, обновилась прошивка, изменились настройки Secure Boot).
+- Где хранится ключ восстановления в компании: в Active Directory (если настроено), в консоли управления (Intune и т.п.) или в защищённом хранилище. На нашем стенде AD есть (домен `corp.vektor.lab` с L1 №42), но **автоматическое сохранение ключей в AD мы не настраивали** — это отдельная тема. Поэтому ключ восстановления на стенде сохраняем вручную в файл.
+
+### LUKS (Linux)
+
+**LUKS (Linux Unified Key Setup)** — стандарт шифрования разделов в Linux. Работает через `cryptsetup` и `dm-crypt` (подсистема ядра). Ключи хранятся в «заголовке» LUKS в начале раздела; есть несколько слотов для паролей/ключей. При загрузке система спрашивает пароль и разблокирует устройство, после чего монтирует его как обычный раздел.
+
+На нашем стенде UBU01 и ASTRA01 установлены **без шифрования диска** (это не входило в уроки установки). Поэтому LUKS мы разберём на отдельном **файловом контейнере** — это безопасно и не трогает систему.
+
+### Сертификаты и PKI
+
+**PKI (Public Key Infrastructure)** — инфраструктура открытых ключей. Проще: система, которая выдаёт и проверяет «цифровые паспорта» — сертификаты.
+
+```text
+Корневой УЦ (Root CA)  ──►  Промежуточный УЦ  ──►  Сертификат сайта/пользователя
+   (доверен ОС)              (подписан корнем)        (подписан промежуточным)
+        │
+        └──► хранится в «доверенных корневых» Windows/Linux/браузера
+```
+
+Сертификат содержит: имя владельца, открытый ключ, срок действия, кто выдал (issuer), для чего годится (EKU — например, «TLS-сервер» или «аутентификация клиента»). Браузер проверяет: подписан ли сертификат цепочкой до доверенного корня, не истёк ли срок, совпадает ли имя сайта.
+
+В России в корпоративной среде это пересекается с КриптоПро CSP и ГОСТ-сертификатами (урок 56) — там своя PKI, свои корневые УЦ (например, УЦ Минцифры). Принцип тот же.
+
+### Порты и протоколы (для контекста)
+
+- HTTPS — TCP 443, TLS поверх HTTP.
+- RDP — TCP 3389 (не про шифрование диска, но часто всплывает в заявках «не пускает по RDP»).
+- SSH — TCP 22 (используется и для LUKS-разблокировки по сети — тема L2+).
 
 ## 3. Аналогия из жизни
 
-Представьте банковскую ячейку в депозитарии. Ячейка — это ваш диск. Внутри — документы. Замок ячейки устроен так, что открыть её можно **двумя разными ключами**: ваш личный ключ (пароль, который вы помните) и аварийный ключ банка в опечатанном конверте (recovery password из 48 цифр). Запирается ячейка одинаково, а открывается любым из них — поэтому конверт надо хранить не в самой ячейке, а в другом месте, иначе он заперт вместе с документами.
+Представьте сейф в квартире. Сам сейф — это зашифрованный диск. Код от сейфа — пароль. Но код можно забыть, поэтому у вас есть **запасной ключ**, который лежит у родственника (это ключ восстановления). А ещё есть **домофон на подъезде** (TPM): если вы заходите в свой подъезд, домофон сам открывает дверь, и до сейфа вы доходите без ввода кода. Но если в подъезде поменяли замок (обновили прошивку, сменили материнскую плату), домофон вас не узнаёт — и тут нужен запасной ключ.
 
-При этом сам замок — хитрый: внутри ячейки лежит «мастер-замок», который вообще никогда не покидает банк, а оба ваших ключа — это лишь разные способы его отпереть. Поэтому если вы потеряли личный ключ, но у вас есть аварийный, вы просто заказываете новый личный ключ, и **все документы остаются на месте** — менять замок целиком не нужно (это и есть смена пароля LUKS без перешифровки).
+Сертификаты — это как **паспорт с печатью**: печать (подпись УЦ) подтверждает, что паспорт настоящий, а не нарисованный в фотошопе. Проверяющий смотрит: печать настоящая? срок действия не истёк? фото совпадает с человеком (имя сайта)?
 
-Сертификаты — это паспортный стол при том же банке. Когда курьер приносит вам документ и говорит «я от Ивана», вы просите паспорт. Паспорт выдан нотариусом, у нотариуса есть лицензия, а лицензию все признают потому, что есть Главный нотариус, чью печать все знают заранее (корневой сертификат в хранилище доверия). Печать на паспорте — это подпись CA. Проверка паспорта бесполезна, если вы принимаете паспорт от любого, кто его нарисовал в Paint: поэтому установка «левого» корневого сертификата — это как выдать лицензию нотариуса первому встречному.
-
-Аналогия перестаёт работать в одном месте: в банке ключи и конверты охраняют люди и стены, а в криптографии охраны нет вообще — если аварийный код утёк, никто не остановит вора, защита держится только на математике и на том, кому вы этот код показали.
+Где аналогия ломается: в реальном сейфе запасной ключ можно скопировать, а ключ восстановления BitLocker — это просто строка, её можно переписать, но если её потерять и TPM «откажет» — данные не вернуть никакими силами.
 
 ## 4. Практика и команды
 
-**1. Статус BitLocker (Windows, CMD/PowerShell от админа).**
-
-```cmd
-manage-bde -status
-manage-bde -status D:
-```
-
-`-status` без буквы показывает все тома. Типичный сокращённый вывод:
-
-```text
-Volume D: [SECRET]
-    Conversion Status:    Fully Encrypted
-    Percentage Encrypted: 100.0%
-    Encryption Method:    XTS-AES 256
-    Protection Status:    Protection On
-    Key Protectors:
-        Password
-        Numerical Password
-```
-
-Смотрим: `Conversion Status` (полностью/в процессе/расшифрован), `Protection Status` (On/Off/Unknown), какие protectors есть. Если `Protection Off` и ключей нет — диск расшифрован, шифрования нет. **Язык вывода зависит от локали ОС**, ключевые слова ищите по смыслу.
-
-**2. Список protectors и recovery password.**
-
-```cmd
-manage-bde -protectors -get D:
-```
-
-```text
-     Password:
-        ID: {A1B2C3D4-...}
-     Numerical Password:
-        ID: {E5F6...}
-        Password:
-            123456-789012-345678-901234-567890-123456-789012-345678
-```
-
-48 цифр — это и есть recovery password. Обратите внимание: `manage-bde -protectors -get` показывает его **без подтверждения**, поэтому эту команду не запускают при пользователе и не скриншотят в чат.
-
-**3. Заблокировать/разблокировать том данных.**
-
-```cmd
-manage-bde -lock D: -ForceDismount
-manage-bde -unlock D: -RecoveryPassword 123456-789012-345678-901234-567890-123456-789012-345678
-manage-bde -unlock D: -Password
-```
-
-`-ForceDismount` нужен, потому что Windows не заблокирует том, который кто-то держит открытым. Без него получите «том используется».
-
-**4. То же в PowerShell (модуль BitLocker, удобнее для скриптов).**
+### Windows: статус BitLocker
 
 ```powershell
-Get-BitLockerVolume | Select-Object MountPoint, VolumeStatus, EncryptionPercentage
-Enable-BitLocker -MountPoint D: -EncryptionMethod XtsAes256 -PasswordProtector -Password (Read-Host -AsSecureString "Пароль")
-Add-BitLockerKeyProtector -MountPoint D: -RecoveryPasswordProtector
-(Get-BitLockerVolume -MountPoint D:).KeyProtector |
+Get-BitLockerVolume
+```
+
+Ключи: без ключей — сводка по всем томам. Смотрим столбцы `VolumeStatus` (например, `FullyEncrypted`, `FullyDecrypted`), `ProtectionStatus` (`On`/`Off`), `EncryptionPercentage`.
+
+Пример вывода (примерный):
+
+```text
+MountPoint VolumeStatus ProtectionStatus EncryptionPercentage
+---------- ------------ ---------------- --------------------
+C:         FullyDecrypted Off              0
+```
+
+### Windows: включить BitLocker с TPM
+
+```powershell
+Enable-BitLocker -MountPoint "C:" -EncryptionMethod XtsAes256 -TpmProtector
+```
+
+`-EncryptionMethod XtsAes256` — современный алгоритм; `-TpmProtector` — использовать TPM для прозрачной разблокировки. На стенде WIN11-CL01 есть vTPM, поэтому сработает. На WIN10-CL02 TPM нет — там нужен `-PasswordProtector` или `-RecoveryPasswordProtector`.
+
+### Windows: добавить ключ восстановления и сохранить его
+
+```powershell
+Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+(Get-BitLockerVolume -MountPoint "C:").KeyProtector
+```
+
+Первая команда добавляет protector типа «пароль восстановления» (генерируется 48-значный). Вторая показывает все protectors — среди них будет `RecoveryPassword` с полем `RecoveryPassword`. **Скопируйте его в файл** и уберите с машины.
+
+### Windows: посмотреть ключ восстановления
+
+```powershell
+(Get-BitLockerVolume -MountPoint "C:").KeyProtector |
     Where-Object KeyProtectorType -eq 'RecoveryPassword' |
     Select-Object -ExpandProperty RecoveryPassword
-Lock-BitLocker -MountPoint D: -ForceDismount
-Unlock-BitLocker -MountPoint D: -RecoveryPassword "123456-..."
-Disable-BitLocker -MountPoint D:      # расшифровать (долго!)
 ```
 
-`-EncryptionMethod XtsAes256` — современный режим; `XtsAes128` быстрее на слабых дисках, `AesCbc256` — устаревший. `Disable-BitLocker` — это **не** «выключить пароль», а полная расшифровка тома: на 500 ГБ это часы.
+Вывод — 48 цифр. Это и есть «тот самый длинный ключ», который просит система.
 
-**5. EFS — шифрование файлов, не диска (для сравнения).**
-
-```cmd
-cipher /status
-cipher /e /s:C:\Temp
-cipher /d /s:C:\Temp
-```
-
-`cipher /e` шифрует папку и всё внутри на уровне файловой системы. Ключ EFS привязан к **сертификату пользователя** в его профиле. Удалили профиль — потеряли файлы. Отсюда мораль: EFS в компаниях почти не используют, потому что администрировать это больно.
-
-**6. Хранилище сертификатов: где смотреть.**
+### Windows: приостановить/возобновить защиту
 
 ```powershell
-Get-ChildItem Cert:\LocalMachine\Root | Measure-Object          # сколько корневых
-Get-ChildItem Cert:\LocalMachine\My | Select-Object Subject, NotAfter, Thumbprint
-Get-ChildItem Cert:\CurrentUser\My | Format-Table Subject, NotAfter
+Suspend-BitLocker -MountPoint "C:" -RebootCount 1
+Resume-BitLocker -MountPoint "C:"
 ```
 
-```cmd
-certutil -store Root
-certutil -store My
-certutil -store -user Root
-```
+`Suspend-BitLocker` полезен перед обновлением BIOS/прошивки — иначе после перезагрузки TPM «не узнает» систему и запросит ключ восстановления. `-RebootCount 1` — приостановить ровно на одну перезагрузку.
 
-`LocalMachine\Root` — доверенные корневые для всей машины. `My` — личные сертификаты с приватными ключами (тут живёт ЭЦП пользователя). `CurrentUser` — только для текущего пользователя. По GUI: `Win+R` → `certlm.msc` (локальный компьютер) или `certmgr.msc` (текущий пользователь) → «Личное», «Доверенные корневые центры сертификации».
+### Windows: GUI
 
-**7. Прочитать и проверить сертификат из файла.**
+Панель управления → «Шифрование диска BitLocker» (`control /name Microsoft.BitLockerDriveEncryption`). Там же — «Резервное копирование ключа восстановления».
 
-```cmd
-certutil -dump ubu01.crt
-certutil -verify ubu01.crt
-certutil -urlfetch -verify cert.cer
-```
-
-`-dump` печатает все поля (Subject, Issuer, Serial, NotBefore/NotAfter, Key Usage, SAN). `-verify` строит цепочку и говорит, доверен ли сертификат. `-urlfetch` дополнительно тянет CRL/OCSP, чтобы проверить отзыв — именно этот шаг чаще всего падает в закрытых сетях, потому что до интернета не достучаться.
-
-**8. Добавить и удалить корневой сертификат (осторожно!).**
-
-```cmd
-certutil -addstore -f Root ubu01.crt
-certutil -delstore Root ubu01.crt
-```
-
-`-addstore Root` требует прав администратора и означает «доверять всему, что подписано этим ключом». В боевой среде это делают только через GPO и только с сертификатами известного УЦ. Удалять удобнее по имени или по отпечатку.
-
-**9. Linux: что вообще за диски.**
+### Linux: создать зашифрованный файловый контейнер (LUKS)
 
 ```bash
-lsblk -f
-sudo blkid
+sudo dd if=/dev/zero of=/home/adm.student/secret.img bs=1M count=64
+sudo cryptsetup luksFormat /home/adm.student/secret.img
 ```
 
-```text
-NAME   FSTYPE      FSVER LABEL   UUID                                 MOUNTPOINTS
-sda    disk
-└─sda3 ext4        1.0           1111...                              /
-sdb    disk
-```
+`dd` создаёт файл-«болванку» 64 МБ. `cryptsetup luksFormat` форматирует его как LUKS-контейнер и спросит пароль (задайте учебный, например `Lab#2026-vektor`). **Внимание:** `luksFormat` уничтожает данные в файле — здесь это ок, потому что файл пустой.
 
-Ищем диск **без** FSTYPE — обычно это и есть новый «чистый» диск, который мы будем шифровать. Проверяйте дважды: `luksFormat` не спрашивает «вы уверены» настолько, насколько хотелось бы.
-
-**10. Создать, открыть, закрыть LUKS-том.**
+### Linux: открыть контейнер и смонтировать
 
 ```bash
-sudo cryptsetup luksFormat --type luks2 /dev/sdb
-sudo cryptsetup luksDump /dev/sdb
-sudo cryptsetup open /dev/sdb secretdisk
-sudo cryptsetup status secretdisk
-sudo mkfs.ext4 /dev/mapper/secretdisk
-sudo mount /dev/mapper/secretdisk /mnt
-sudo umount /mnt
-sudo cryptsetup close secretdisk
+sudo cryptsetup luksOpen /home/adm.student/secret.img secret_vol
+sudo mkfs.ext4 /dev/mapper/secret_vol
+sudo mkdir -p /mnt/secret
+sudo mount /dev/mapper/secret_vol /mnt/secret
 ```
 
-`luksDump` печатает заголовок: `Version: 2`, `Cipher: aes-xts-plain64`, `Key: 512 bits`, список keyslots. `open` создаёт `/dev/mapper/secretdisk`; `luksOpen` — тот же самый старый синоним, встретите в документации. Пока том не открыт, `file -s /dev/sdb` покажет `data` — это и есть шифротекст, из которого нельзя вытащить ничего без ключа.
+`luksOpen` создаёт устройство `/dev/mapper/secret_vol`, `mkfs.ext4` создаёт на нём файловую систему, `mount` монтирует в `/mnt/secret`. Теперь туда можно писать файлы — они на диске лежат зашифрованными.
 
-**11. Бэкап заголовка и смена пароля.**
+### Linux: закрыть контейнер
 
 ```bash
-sudo cryptsetup luksHeaderBackup /dev/sdb --header-backup-file /root/luks-header-sdb.img
-sudo cryptsetup luksAddKey /dev/sdb
-sudo cryptsetup luksChangeKey /dev/sdb
-sudo cryptsetup luksUUID /dev/sdb
+sudo umount /mnt/secret
+sudo cryptsetup luksClose secret_vol
 ```
 
-Файл бэкапа заголовка — это фактически ключ ко всем данным: храните его на отдельном носителе, а не на той же машине. `luksAddKey` добавляет второй пароль (резервный слот — обязательная практика).
+`umount` отмонтирует, `luksClose` уберёт устройство из `/dev/mapper`. Файл `secret.img` остаётся, но прочитать его без пароля нельзя.
 
-**12. Сертификат в Linux: посмотреть и проверить.**
+### Linux: посмотреть заголовок LUKS
 
 ```bash
-openssl x509 -in ubu01.crt -noout -subject -issuer -dates -fingerprint -sha256
-openssl x509 -in ubu01.crt -noout -text | head -40
-openssl verify -CAfile root.crt leaf.crt
-openssl s_client -connect fs01.corp.vektor.lab:443 -showcerts
+sudo cryptsetup luksDump /home/adm.student/secret.img
 ```
 
-`-subject`/`-issuer` — кому и кем выдан (у самоподписанного они совпадают). `-dates` — срок; «сертификат истёк» и «на сервере неверное время» — две самые частые причины ошибок. `s_client` покажет всю цепочку, которую отдаёт сервер. В Ubuntu корневые сертификаты лежат в `/etc/ssl/certs`, свои добавляют в `/usr/local/share/ca-certificates/*.crt` и применяют `sudo update-ca-certificates`; посмотреть доверенные — `trust list`.
+Показывает версию LUKS, алгоритм шифра, количество слотов с ключами. Полезно, когда пользователь говорит «я забыл пароль» — видно, сколько слотов занято (если есть второй — можно открыть им).
+
+### Сертификат сайта: посмотреть из PowerShell
+
+```powershell
+$req = [Net.HttpWebRequest]::Create("https://www.microsoft.com")
+$req.GetResponse() | Out-Null
+$req.ServicePoint.Certificate | Format-List Subject, Issuer, NotBefore, NotAfter
+```
+
+`Subject` — кому выдан, `Issuer` — кто выдал (УЦ), `NotBefore`/`NotAfter` — срок действия. Если `NotAfter` в прошлом — сертификат истёк, браузер будет ругаться.
+
+### Сертификат сайта: посмотреть из Linux
+
+```bash
+echo | openssl s_client -connect www.microsoft.com:443 -servername www.microsoft.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+```
+
+`openssl s_client` устанавливает TLS-соединение, `openssl x509` разбирает сертификат. Смотрим `subject`, `issuer`, `notBefore`, `notAfter`.
+
+### Доверенные корневые сертификаты в Windows
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\Root | Select-Object -First 5 Subject, NotAfter
+```
+
+`Cert:\LocalMachine\Root` — хранилище доверенных корневых сертификатов. Если корень какого-то УЦ здесь есть, сертификаты этого УЦ будут приниматься без предупреждений.
 
 ## 5. Лабораторная работа (пошаговый сценарий на виртуалке)
 
 ### Предусловия
 
-- **DC01** — работает, AD DS/DNS/DHCP настроены, домен `corp.vektor.lab` есть.
-- **WIN11-CL01** — в домене, вход `VEKTOR\adm.student` (или `ivanov` + локальный админ для команд), есть виртуальный TPM (VM → Settings → Add → Trusted Platform Module). Если TPM нет — лабу по BitLocker делаем только на томе данных, он работает без TPM.
-- **UBU01** — доступ по SSH, есть `sudo`, установлен `cryptsetup` (`sudo apt install cryptsetup` если вдруг нет).
-- **ASTRA01** — не требуется.
-- У вас есть `stand-log.md` и доступ к консоли VMware Workstation.
-
-Честное предупреждение: на неактивированной evaluation-копии Windows BitLocker иногда отказывается включать шифрование системного диска. Для лабы это не критично — мы шифруем **отдельный том данных**, там ограничений меньше. Если и на томе данных команда откажется — не ломайте голову, зафиксируйте это и пройдите LUKS-часть и часть с сертификатами, они полностью самодостаточны.
+- WIN11-CL01 (Windows 11, vTPM, домен `corp.vektor.lab`, учётка `ivanov` или `adm.student`).
+- WIN10-CL02 (Windows 10 LTSC, **без TPM**, домен, учётка `petrova` или `adm.student`).
+- UBU01 (Ubuntu Server 24.04, SSH, `adm.student`).
+- DC01 (Windows Server 2022, домен `corp.vektor.lab`).
+- Все ВМ в сети VMnet8, адреса по DHCP (после L1 №33), DC01 — 10.10.10.10.
+- На хосте есть папки `C:\Lab\vektor\docs` и `C:\Support\Tickets`.
 
 ### Снапшот
 
-На каждой затрагиваемой ВМ: VM → Snapshot → Take Snapshot, имя `before-l1-066` (WIN11-CL01, UBU01, DC01). Или из командной строки хоста:
+На хосте (PowerShell):
 
-```cmd
-"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe" snapshot "D:\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-066
-"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe" snapshot "D:\VMs\UBU01\UBU01.vmx" before-l1-066
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" snapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-066
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-066
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-066
+vmrun -T ws snapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-066
 ```
 
-Пути подставьте свои; имя снапшота — ровно `before-l1-066`.
+`-vp` — пароль шифрования ВМ (нужен только для WIN11-CL01 из-за vTPM). `[ПРОВЕРИТЬ]` синтаксис `-vp` в вашей версии VMware Workstation.
 
 ### Шаги
 
-1. **WIN11-CL01.** Проверяем исходное состояние: `manage-bde -status` и `Get-Tpm`. Ожидаемо: `Conversion Status: Fully Decrypted` и `TpmPresent: True, TpmReady: True`. Если TPM нет — записываем это в журнал и идём дальше.
+1. **WIN11-CL01, PowerShell от администратора.** Проверяем текущий статус BitLocker:
 
-2. **WIN11-CL01, выключенная ВМ.** VM → Settings → Add → Hard Disk → 2 ГБ, тип SCSI/NVMe. Включаем ВМ. В PowerShell: `Get-Disk`. Ожидаемо: новый диск номер 1 со статусом `Offline`/`RAW`.
-
-3. **WIN11-CL01.** Готовим том:
-   ```powershell
-   Initialize-Disk -Number 1 -PartitionStyle GPT
-   New-Partition -DiskNumber 1 -UseMaximumSize -DriveLetter D
-   Format-Volume -DriveLetter D -FileSystem NTFS -NewFileSystemLabel "SECRET"
-   "тестовый документ бухгалтерии" | Out-File D:\report.txt
-   ```
-   Ожидаемо: в Проводнике появился диск D: с меткой SECRET и файлом `report.txt`.
-
-4. **WIN11-CL01.** Включаем BitLocker на томе данных с паролем:
-   ```powershell
-   Enable-BitLocker -MountPoint D: -EncryptionMethod XtsAes256 -PasswordProtector -Password (Read-Host -AsSecureString "Пароль диска")
-   Get-BitLockerVolume -MountPoint D:
-   ```
-   Ожидаемо: `VolumeStatus: EncryptionInProgress`, через минуту-две `FullyEncrypted`, `ProtectionStatus: On`.
-
-5. **WIN11-CL01.** Добавляем второй protector — recovery password, и записываем 48 цифр в `stand-log.md` **на хост**, не на стенд:
-   ```powershell
-   Add-BitLockerKeyProtector -MountPoint D: -RecoveryPasswordProtector
-   (Get-BitLockerVolume -MountPoint D:).KeyProtector | Select-Object KeyProtectorType, RecoveryPassword
-   manage-bde -protectors -get D:
-   ```
-   Ожидаемо: в списке два protector'а — `Password` и `Numerical Password`.
-
-6. **WIN11-CL01.** Проверяем, что шифрование реально работает:
-   ```powershell
-   Lock-BitLocker -MountPoint D: -ForceDismount
-   Get-ChildItem D:\            # ожидаем ошибку доступа / «том недоступен»
-   Unlock-BitLocker -MountPoint D: -RecoveryPassword "123456-..."
-   Get-ChildItem D:\            # снова видим report.txt
-   ```
-   Ожидаемо: после Lock том пропадает из Проводника, после Unlock — возвращается.
-
-7. **UBU01, выключенная ВМ.** Добавляем второй диск 2 ГБ (VM → Settings → Add → Hard Disk). Включаем, заходим по SSH, выполняем `lsblk -f`. Ожидаемо: появился `/dev/sdb` без файловой системы. **Убеждаемся, что это именно sdb, а не sda.**
-
-8. **UBU01.** Создаём LUKS2:
-   ```bash
-   sudo cryptsetup luksFormat --type luks2 /dev/sdb
-   sudo cryptsetup luksDump /dev/sdb
-   ```
-   На вопрос отвечаем `YES` заглавными. Ожидаемо: в дампе `Version: 2`, `Cipher: aes-xts-plain64`, `Key: 512 bits`, `Keyslots: 0: luks2`.
-
-9. **UBU01.** Открываем, форматируем, монтируем, пишем файл, закрываем:
-   ```bash
-   sudo cryptsetup open /dev/sdb secretdisk
-   lsblk -f
-   sudo mkfs.ext4 /dev/mapper/secretdisk
-   sudo mount /dev/mapper/secretdisk /mnt
-   echo "секрет" | sudo tee /mnt/test.txt
-   sudo umount /mnt
-   sudo cryptsetup close secretdisk
-   sudo file -s /dev/sdb
-   ```
-   Ожидаемо: `lsblk` показывает `sdb` → `crypt` → `secretdisk` → ext4; после `close` `file -s /dev/sdb` выдаёт `data` (никакой подсказки, что там ФС).
-
-10. **UBU01.** Делаем бэкап заголовка и второй пароль:
-    ```bash
-    sudo cryptsetup luksHeaderBackup /dev/sdb --header-backup-file /root/luks-header-sdb.img
-    sudo cryptsetup luksAddKey /dev/sdb
-    sudo ls -l /root/luks-header-sdb.img
+    ```powershell
+    Get-BitLockerVolume
     ```
-    Ожидаемо: файл ~16 МБ. Копируем его на хост через `scp` и **удаляем со стенда**, записав в журнал, где он лежит.
 
-11. **UBU01.** Мини-PKI: делаем самоподписанный сертификат и разбираем его:
-    ```bash
-    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-      -keyout ubu01.key -out ubu01.crt -subj "/CN=ubu01.corp.vektor.lab"
-    openssl x509 -in ubu01.crt -noout -subject -issuer -dates -fingerprint -sha256
-    openssl x509 -in ubu01.crt -noout -text | head -40
+    Ожидаемо: `VolumeStatus = FullyDecrypted`, `ProtectionStatus = Off` — шифрование ещё не включено.
+
+2. **WIN11-CL01.** Включаем BitLocker с TPM:
+
+    ```powershell
+    Enable-BitLocker -MountPoint "C:" -EncryptionMethod XtsAes256 -TpmProtector
     ```
-    Ожидаемо: Subject и Issuer одинаковые (самоподписанный), срок — год, в блоке `X509v3 extensions` нет SAN (это важно: браузеры такие сертификаты не принимают для сайтов).
 
-12. **WIN11-CL01.** Смотрим на цепочку доверия и «опасную» установку корневого сертификата:
+    Ожидаемо: команда запускает шифрование. Проверка `Get-BitLockerVolume` покажет `VolumeStatus = EncryptionInProgress`, затем `FullyEncrypted`. Шифрование 60-ГБ диска в виртуалке может занять 10–30 минут `[ПРОВЕРИТЬ по вашей машине]`.
+
+3. **WIN11-CL01.** Добавляем ключ восстановления и сохраняем его:
+
+    ```powershell
+    Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+    (Get-BitLockerVolume -MountPoint "C:").KeyProtector |
+        Where-Object KeyProtectorType -eq 'RecoveryPassword' |
+        Select-Object -ExpandProperty RecoveryPassword
+    ```
+
+    Ожидаемо: 48 цифр. **Скопируйте в файл** `C:\Lab\vektor\docs\bitlocker-win11-cl01.txt` на хосте (через общую папку VMware или вручную). В рабочей среде ключ хранится в AD или в консоли управления — здесь мы делаем вручную, потому что автоматическое сохранение в AD не настраивали.
+
+4. **WIN11-CL01.** Перезагружаем ВМ. Ожидаемо: система загружается **без запроса ключа** — TPM разблокировал диск автоматически. Это нормальное поведение.
+
+5. **WIN10-CL02, PowerShell от администратора.** Здесь TPM нет, поэтому включаем с паролем:
+
+    ```powershell
+    Enable-BitLocker -MountPoint "C:" -EncryptionMethod XtsAes256 -PasswordProtector
+    ```
+
+    Ожидаемо: команда запросит пароль (задайте `Lab#2026-vektor`). После перезагрузки система попросит этот пароль при загрузке.
+
+6. **WIN10-CL02.** Добавляем ключ восстановления (на случай забытого пароля):
+
+    ```powershell
+    Add-BitLockerKeyProtector -MountPoint "C:" -RecoveryPasswordProtector
+    (Get-BitLockerVolume -MountPoint "C:").KeyProtector |
+        Where-Object KeyProtectorType -eq 'RecoveryPassword' |
+        Select-Object -ExpandProperty RecoveryPassword
+    ```
+
+    Ожидаемо: 48 цифр. Сохраните в `C:\Lab\vektor\docs\bitlocker-win10-cl02.txt`.
+
+7. **UBU01, SSH от `adm.student`.** Создаём LUKS-контейнер:
+
+    ```bash
+    dd if=/dev/zero of=/home/adm.student/secret.img bs=1M count=64
+    sudo cryptsetup luksFormat /home/adm.student/secret.img
+    ```
+
+    Ожидаемо: `cryptsetup` предупредит, что данные будут уничтожены, попросит подтверждение (`YES` заглавными) и пароль. Задайте `Lab#2026-vektor`.
+
+8. **UBU01.** Открываем, форматируем, монтируем:
+
+    ```bash
+    sudo cryptsetup luksOpen /home/adm.student/secret.img secret_vol
+    sudo mkfs.ext4 /dev/mapper/secret_vol
+    sudo mkdir -p /mnt/secret
+    sudo mount /dev/mapper/secret_vol /mnt/secret
+    echo "test" | sudo tee /mnt/secret/test.txt
+    ```
+
+    Ожидаемо: файл `test.txt` создан. Проверьте `ls /mnt/secret` — файл на месте.
+
+9. **UBU01.** Закрываем контейнер и проверяем, что данные недоступны:
+
+    ```bash
+    sudo umount /mnt/secret
+    sudo cryptsetup luksClose secret_vol
+    sudo cryptsetup luksDump /home/adm.student/secret.img
+    ```
+
+    Ожидаемо: `luksDump` покажет заголовок LUKS (версия, алгоритм, слоты). Попытка `cat /home/adm.student/secret.img | head` покажет мусор — данные зашифрованы.
+
+10. **WIN11-CL01, PowerShell.** Смотрим сертификат сайта:
+
+    ```powershell
+    $req = [Net.HttpWebRequest]::Create("https://www.microsoft.com")
+    $req.GetResponse() | Out-Null
+    $req.ServicePoint.Certificate | Format-List Subject, Issuer, NotBefore, NotAfter
+    ```
+
+    Ожидаемо: `Subject` содержит `CN=www.microsoft.com`, `Issuer` — какой-то публичный УЦ (например, DigiCert), `NotAfter` — будущая дата.
+
+11. **UBU01.** То же через `openssl`:
+
+    ```bash
+    echo | openssl s_client -connect www.microsoft.com:443 -servername www.microsoft.com 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+    ```
+
+    Ожидаемо: строки `subject=`, `issuer=`, `notBefore=`, `notAfter=`. Сравните с выводом из шага 10 — должны совпадать.
+
+12. **WIN11-CL01.** Смотрим доверенные корни:
+
     ```powershell
     Get-ChildItem Cert:\LocalMachine\Root | Measure-Object
-    certutil -store Root | findstr /C:"CN=" | Measure-Object
     ```
-    Скопируйте `ubu01.crt` на WIN11-CL01 (общая папка VMware → Shared Folders), затем в CMD от админа:
-    ```cmd
-    certutil -verify ubu01.crt
-    certutil -addstore -f Root ubu01.crt
-    certutil -verify ubu01.crt
-    ```
-    Ожидаемо: сначала `-verify` ругается («не удаётся построить цепочку до доверенного корневого»), после `-addstore` — проверка проходит. Это и есть демонстрация того, что доверие — это запись в хранилище, а не свойство сертификата.
 
-13. **WIN11-CL01.** Убираем за собой и смотрим GUI-путь: `certlm.msc` → «Доверенные корневые центры сертификации» → находим `ubu01` → удаляем, либо `certutil -delstore Root ubu01.crt`. Записываем в `stand-log.md` всё, что появилось.
+    Ожидаемо: несколько десятков сертификатов (примерно 50–100 в зависимости от версии Windows) `[ПРОВЕРИТЬ]`. Это те УЦ, которым Windows доверяет «по умолчанию».
+
+13. **Запись в журнал.** В `C:\Lab\vektor\stand-log.md` добавьте строку: «L1 №66: BitLocker включён на WIN11-CL01 (TPM) и WIN10-CL02 (пароль); ключи восстановления сохранены в docs; LUKS-контейнер на UBU01 создан и проверен».
 
 ### Проверка
 
-- [ ] `manage-bde -status D:` показывает `Fully Encrypted`, `XTS-AES 256`, два protector'а.
-- [ ] 48-значный recovery password записан в `stand-log.md` на хосте (не на стенде).
-- [ ] После `Lock-BitLocker` файл `D:\report.txt` недоступен, после `Unlock-BitLocker` — снова читается.
-- [ ] `sudo cryptsetup luksDump /dev/sdb` показывает LUKS2 и один-два keyslot.
-- [ ] `sudo file -s /dev/sdb` после `close` выдаёт `data`, а не `ext4 filesystem`.
-- [ ] Бэкап заголовка лежит на хосте, а не на UBU01.
-- [ ] `openssl x509 -noout -subject -issuer` для `ubu01.crt` показывает одинаковые поля.
-- [ ] Сертификат `ubu01.crt` удалён из хранилища Root на WIN11-CL01.
-- [ ] В `stand-log.md` появилась запись про новый диск, метку SECRET и LUKS-том.
+- [ ] `Get-BitLockerVolume` на WIN11-CL01 показывает `FullyEncrypted` и `ProtectionStatus = On`.
+- [ ] WIN11-CL01 после перезагрузки загружается без запроса ключа (TPM работает).
+- [ ] WIN10-CL02 после перезагрузки просит пароль.
+- [ ] Ключи восстановления сохранены в `C:\Lab\vektor\docs\bitlocker-win11-cl01.txt` и `bitlocker-win10-cl02.txt`.
+- [ ] На UBU01 `sudo cryptsetup luksDump /home/adm.student/secret.img` показывает заголовок LUKS.
+- [ ] Файл `test.txt` доступен после `luksOpen` + `mount` и недоступен после `luksClose`.
+- [ ] Сертификат `www.microsoft.com` успешно читается и в PowerShell, и через `openssl`.
 
 ### Сломай и почини
 
-```
-Пользователь: ivanov (Иван Иванов, бухгалтерия)
-ВМ: WIN11-CL01
-Что написал: «Диск D: опять просит пароль! Я вчера что-то вводил, а какой
-пароль — не помню, записал на стикер и стикер потерял. Там архивы за квартал,
-мне до конца дня нужно. Можно как-то сбросить этот пароль?»
-Срочность: высокая
-```
+**Заявка:**
 
-**Воспроизводим поломку (вы, на WIN11-CL01, от админа):**
+> **Пользователь:** Мария Петрова (HR), ВМ WIN10-CL02.
+> **Что написала:** «После перезагрузки просит какой-то пароль при загрузке, я его не помню. Раньше не просило. Срочно, у меня отчёт.»
+> **Срочность:** Высокая.
 
-```powershell
-Lock-BitLocker -MountPoint D: -ForceDismount
-# имитируем пользователя, который не помнит пароль:
-manage-bde -unlock D: -Password     # вводим заведомо неверный пароль
-```
-
-Ожидаемо: ошибка вида «The password failed to unlock volume D:». Данные на месте, но недоступны. Это **учебная** поломка — мы сами её сделали и знаем, что recovery password у нас есть. В реальности всё то же самое, только стикер потерян по-настоящему.
+**Как воспроизвести поломку:** на WIN10-CL02 (уже с BitLocker и паролем из шага 5) перезагрузите ВМ. Появится экран BitLocker с полем ввода пароля. «Пользователь» пароль не помнит — это и есть ситуация.
 
 **Диагностика по шагам:**
 
-1. Убеждаемся, что это точно BitLocker, а не права доступа: `manage-bde -status D:` → смотрим `Protection Status: Protection On`, `Conversion Status: Fully Encrypted`. Значит, диск зашифрован и заперт.
+1. Уточняем у пользователя: что именно просит — пароль или ключ восстановления? На экране BitLocker обычно есть ссылка «Введите ключ восстановления» (Enter recovery key). Если пользователь видит поле для пароля — это `PasswordProtector`, если для 48 цифр — `RecoveryPasswordProtector`.
+2. Проверяем, что ВМ — именно WIN10-CL02 (а не WIN11-CL01, где TPM и пароля нет).
+3. Смотрим в `C:\Lab\vektor\docs\bitlocker-win10-cl02.txt` — там сохранён ключ восстановления из шага 6.
+4. Вводим ключ восстановления на экране BitLocker (через ссылку «Введите ключ восстановления»). Система загружается.
+5. После входа в систему: `Get-BitLockerVolume` — проверяем, что `ProtectionStatus = On`. При необходимости меняем пароль: `Remove-BitLockerKeyProtector` для старого `PasswordProtector` и `Add-BitLockerKeyProtector -PasswordProtector` для нового `[ПРОВЕРИТЬ точный синтаксис в вашей версии]`.
 
-2. Смотрим, какие способы разблокировки вообще существуют: `manage-bde -protectors -get D:`. Ожидаемо: `Password` (не знаем) и `Numerical Password` (48 цифр — должны быть у нас).
+**Решение:** ключ восстановления из файла. В рабочей среде — из AD (если настроено) или из консоли управления.
 
-3. Достаём recovery password из журнала стенда / из хранилища ключей (в реальной компании — из AD, см. примечание ниже). Проверяем, что это именно 48 цифр, а не что-то похожее.
+**Ответ пользователю:** «Мария, всё в порядке. На вашем компьютере включено шифрование диска BitLocker — это защита данных, если ноутбук потеряется. При загрузке он просит пароль, который вы задавали. Я разблокировал систему ключом восстановления. Пароль от BitLocker я вам напомню отдельно в защищённом канале. Пожалуйста, не выключайте компьютер без необходимости и не меняйте настройки загрузки — это может снова вызвать запрос ключа.»
 
-4. Разблокируем: `manage-bde -unlock D: -RecoveryPassword <48 цифр>`. Ожидаемо: `The password successfully unlocked volume D:`.
-
-5. Проверяем данные: `Get-ChildItem D:\` и открываем `report.txt`. Если файлы читаются — задача решена, шифрование не пострадало.
-
-6. Меняем неудобный пароль: удаляем старый protector и добавляем новый.
-   ```powershell
-   manage-bde -protectors -delete D: -Type Password -ID {GUID-из-шага-2}
-   manage-bde -protectors -add D: -Password
-   ```
-   Windows спросит новый пароль. Ожидаемо: `manage-bde -protectors -get D:` показывает новый `Password` и тот же `Numerical Password`.
-
-7. Пишем пользователю, объясняем, что пароль сбрасывать «в никуда» нельзя, но у нас есть аварийный ключ; просим впредь не хранить пароль на стикере.
-
-**Ответ пользователю (в тикете):**
-
-> Иван, добрый день. Диск D: разблокирован, доступ восстановлен, данные на месте — проверил, файлы открываются. Причина: диск защищён шифрованием BitLocker, а пароль от него был утерян. Я поставил новый пароль, его нужно будет ввести при следующей блокировке; передам его вам отдельно при встрече. Пожалуйста, не храните пароли на бумаге — для этого есть менеджер паролей. Если снова увидите такое окно — сразу пишите в поддержку, не пытайтесь подбирать пароль, после нескольких попыток Windows потребует код восстановления.
-
-**Закрытие заявки:** категория «Шифрование / BitLocker», решение — «разблокировка томом восстановления, замена protector'а», в комментарии — что recovery password не передавался по почте/чату. Время — 15–20 минут.
-
-Важно на будущее: в реальной компании recovery-ключи BitLocker хранятся в Active Directory (это настраивается групповой политикой и требует расширения схемы AD). Посмотреть их можно примерно так — но это работает только если эскалация ключей настроена, в нашей лабе она не настраивалась:
-
-```powershell
-Get-ADObject -Filter 'ObjectClass -eq "msFVE-RecoveryInformation"' `
-  -SearchBase "CN=WIN11-CL01,CN=Computers,DC=corp,DC=vektor,DC=lab" `
-  -Properties msFVE-RecoveryPassword
-```
-
-`[ПРОВЕРИТЬ]` на стенде без настроенной политики результат будет пустым — это нормально.
+**Закрытие заявки:** категория «Безопасность → BitLocker», решение «Разблокировка ключом восстановления», примечание «Ключ восстановления хранится в docs; пользователю напомнен пароль».
 
 ### Что изменилось на стенде
 
-- **WIN11-CL01**: добавлен второй виртуальный диск 2 ГБ, том `D:` с меткой `SECRET`, NTFS, зашифрован BitLocker (XTS-AES 256), protectors: `Password` + `Numerical Password`. Recovery password записан в `stand-log.md` на хосте. Сертификат `ubu01.crt` устанавливался в Root и был удалён — хранилище вернулось в исходное состояние.
-- **UBU01**: добавлен диск `/dev/sdb` 2 ГБ, размечен как LUKS2 (`aes-xts-plain64`, 512-bit), два пароля (слота), внутри ext4, метки нет. Файл `/mnt/test.txt` создан (в закрытом томе). Бэкап заголовка `/root/luks-header-sdb.img` скопирован на хост и удалён с ВМ.
-- **DC01**: без изменений.
-- Остальные ВМ не затрагивались.
+- WIN11-CL01: BitLocker включён (TPM + ключ восстановления), ключ сохранён в `C:\Lab\vektor\docs\bitlocker-win11-cl01.txt`.
+- WIN10-CL02: BitLocker включён (пароль + ключ восстановления), ключ сохранён в `C:\Lab\vektor\docs\bitlocker-win10-cl02.txt`.
+- UBU01: создан LUKS-контейнер `/home/adm.student/secret.img` (64 МБ), проверен цикл open/mount/close.
+- DC01: без изменений.
+- Новых ВМ, ролей, учёток и адресов нет.
 
 ### Откат
 
-Если что-то пошло не так (например, вы по ошибке выполнили `luksFormat` на `/dev/sda` и убили UBU01, или `Disable-BitLocker` запустился не туда):
+На хосте (PowerShell):
 
-1. Выключить ВМ.
-2. VM → Snapshot → Snapshot Manager → выбрать `before-l1-066` → **Revert**. Для каждой ВМ отдельно (WIN11-CL01, UBU01).
-3. Включить, проверить: `lsblk -f` на UBU01 (нет `/dev/sdb`), `Get-Disk` на WIN11-CL01 (нет второго диска).
-4. Дописать в `stand-log.md` строку «откат к before-l1-066, причина: ...». Файл журнала живёт на хосте, поэтому откатом ВМ он не затрагивается — это специально.
+```powershell
+vmrun -T ws -vp "Lab#2026-vektor" revertToSnapshot "C:\Lab\vektor\VMs\WIN11-CL01\WIN11-CL01.vmx" before-l1-066
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\WIN10-CL02\WIN10-CL02.vmx" before-l1-066
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\UBU01\UBU01.vmx" before-l1-066
+vmrun -T ws revertToSnapshot "C:\Lab\vektor\VMs\DC01\DC01.vmx" before-l1-066
+```
 
-Откат необратим для данных, созданных после снапшота: `report.txt` и `test.txt` исчезнут вместе с дисками.
+После отката удалите файлы ключей из `C:\Lab\vektor\docs` (они относятся к откаченному состоянию) и допишите в `stand-log.md` строку об откате.
 
 ## 6. Ошибки новичков и безопасность
 
-1. **Хранить recovery password на самом зашифрованном диске.** → Ключ заперт вместе с данными, восстановление невозможно. → Ключ хранится отдельно: в AD, в менеджере секретов, в бумажном сейфе у руководителя ИБ. Для стенда — в `stand-log.md` на хосте.
+1. **Ошибка:** включить BitLocker и не сохранить ключ восстановления.
+   **К чему приводит:** при сбое TPM или смене железа данные не вернуть. Восстановление невозможно.
+   **Как правильно:** всегда сначала `Add-BitLockerKeyProtector -RecoveryPasswordProtector`, сохранить ключ в защищённое место, и только потом включать шифрование.
 
-2. **Включать BitLocker «на всякий случай» без записи ключа.** → Через полгода ноутбук после обновления BIOS просит recovery-код, кода нет, данные потеряны навсегда. → Процедура: сначала убедиться, что ключ эскалирован в AD/учтён, только потом шифровать. Проверять это надо **до** выдачи техники пользователю.
+2. **Ошибка:** хранить ключ восстановления в том же файле на том же диске.
+   **К чему приводит:** если диск украдут — украдут и ключ. Шифрование бесполезно.
+   **Как правильно:** ключ — в AD, в консоли управления или в защищённом хранилище вне машины.
 
-3. **Думать, что BitLocker/LUKS защищает от вирусов и от коллег-админов.** → Пока система работает и том смонтирован, данные читаются всеми процессами и любым админом. → Шифрование диска защищает только от физической кражи/снятия диска. От злого ПО и лишних прав защищают права доступа, EDR и политики (см. уроки 63 и 65).
+3. **Ошибка:** `cryptsetup luksFormat` на разделе с данными «на всякий случай».
+   **К чему приводит:** данные уничтожены безвозвратно.
+   **Как правильно:** перед `luksFormat` всегда проверять, что это пустой файл/раздел; на боевых системах — снапшот и бэкап.
 
-4. **Ставить неизвестный корневой сертификат, «чтобы сайт открылся».** → Любой, у кого есть этот ключ, может подделать любой HTTPS-сайт и незаметно читать трафик (MITM). → Корневые сертификаты — только от известного УЦ, только через GPO/централизованно, с письменным обоснованием. Одноразово «на посмотреть» — и сразу удалить.
+4. **Ошибка:** приостановить BitLocker и забыть возобновить.
+   **К чему приводит:** диск остаётся незашифрованным, защита не работает.
+   **Как правильно:** `Suspend-BitLocker -RebootCount 1` — приостановка ровно на одну перезагрузку; после — проверить `Get-BitLockerVolume`.
 
-5. **Путать EFS и BitLocker.** → Пользователь шифрует файл EFS, потом ему переустанавливают Windows, профиль удаляется — файлы не открыть, потому что ключ EFS был в профиле. → Перед переустановкой ОС всегда проверять `cipher /status` и экспортировать сертификат EFS.
+5. **Ошибка:** думать, что «сертификат недействителен» = «сайт взломали».
+   **К чему приводит:** паника у пользователя, неверная эскалация.
+   **Как правильно:** проверить срок действия (`NotAfter`), имя (`Subject`), издателя (`Issuer`). Чаще всего — истёк срок или неверные часы на компьютере.
 
-6. **Экспортировать PFX с приватным ключом «просто скинь мне в чат».** → Контейнер PKCS#12 содержит приватный ключ; попал в мессенджер — считайте, ключ скомпрометирован, а вместе с ним и ЭЦП. → Только личная передача на носителе, с паролем, переданным другим каналом, с записью в журнале.
+6. **Ошибка:** игнорировать предупреждение браузера о сертификате и «продолжить на свой риск».
+   **К чему приводит:** возможна утечка пароля на поддельный сайт.
+   **Как правильно:** остановиться, проверить сертификат, сообщить в ИБ. В рабочей среде — по инструкции.
 
-7. **Считать, что смена пароля LUKS перешифровывает диск.** → Пользователь меняет пароль в системе, думает, что «всё обновилось», а старый пароль LUKS по-прежнему работает. → Пароли LUKS меняются только через `cryptsetup luksChangeKey`/`luksAddKey`, и старый слот надо явно удалить (`luksRemoveKey`).
+7. **Ошибка:** на Linux-машине с LUKS перезагрузиться, не зная пароля.
+   **К чему приводит:** система не загрузится, данные недоступны.
+   **Как правильно:** пароль LUKS — в защищённом хранилище; на боевых серверах — процедура восстановления (L2+).
 
-8. **Забыть про время.** → «Сертификат недействителен», хотя всё правильно: на машине сбиты дата/часы или истёк срок. → Первое, что проверяем при любой ошибке сертификата: `w32tm /query /status` на Windows, `timedatectl` на Linux.
+### Безопасность
 
-**Безопасность.** В боевой среде: нельзя передавать recovery-ключи BitLocker и пароли LUKS по почте, в мессенджерах и в тикетах — только по процедуре с проверкой личности (в идеале — лично или через менеджер секретов). Нельзя отключать шифрование на ноутбуках с персональными данными «потому что тормозит»: это прямое нарушение требований по защите ПДн (152-ФЗ, подробнее в уроке 67) и почти всегда — внутренней политики ИБ. Нельзя устанавливать корневые сертификаты по просьбе пользователя без согласования. И нельзя хранить бэкапы LUKS-заголовков рядом с самим диском — это как приклеить ключ скотчем к сейфу. На стенде мы делаем небезопасные вещи (единый пароль, пароль на стикере в легенде) исключительно ради учебной наглядности.
+- **Нельзя** хранить ключи восстановления BitLocker в общедоступных папках (`\\FS01\Obshchee`), в почте, в мессенджерах.
+- **Нельзя** отключать BitLocker «чтобы не мешал» на рабочих ноутбуках с персональными данными — это нарушение политики ИБ и потенциально 152-ФЗ (тема урока 67).
+- **Нельзя** передавать ключ восстановления пользователю в открытом виде по почте — только по защищённому каналу или лично.
+- **Нельзя** на стенде использовать реальные пароли и ключи — только учебные (`Lab#2026-vektor`).
+- В рабочей среде включение BitLocker без согласования с ИБ может быть нарушением регламента — уточняйте политику компании.
 
 ## 7. Вопросы на собеседовании
 
-**1. Чем BitLocker отличается от EFS?**
+**Вопрос 1. «Что такое BitLocker и зачем он нужен?»**
 
-**Ответ.** BitLocker — шифрование целого тома на уровне драйвера `fvevol`: шифруются все сектора, включая системные файлы, своп и временные файлы. Ключ разблокировки — protector (TPM, пароль, USB, recovery password). EFS — шифрование отдельных файлов и папок средствами NTFS: ключ привязан к сертификату пользователя в его профиле, остальные файлы на диске остаются открытыми. Практический вывод: BitLocker защищает от кражи диска целиком, EFS — от «коллега зашёл под своей учёткой и прочитал мою папку», но EFS хрупок: потерял профиль — потерял данные.
+Ответ: BitLocker — это штатное шифрование диска в Windows. Шифрует том целиком, чтобы при потере или краже ноутбука данные нельзя было прочитать, даже вынув диск. Разблокировка — через TPM (прозрачно), пароль, PIN или USB-ключ. Ключ восстановления — аварийный вход на 48 цифр.
 
-**Что хочет услышать интервьюер:** понимание уровня (том vs файл), роли ключа/сертификата и рисков EFS.
+*Что хочет услышать интервьюер:* что вы понимаете разницу между «шифрование» и «пароль на вход в Windows», знаете про TPM и ключ восстановления.
 
-**Красный флаг:** «BitLocker — это пароль на компьютер», «EFS и BitLocker — одно и то же, только кнопки разные».
+*Красный флаг:* «BitLocker — это пароль на BIOS» или «это антивирус».
 
-**2. Пользователь звонит: «Ноутбук при включении просит длинный код». Ваши действия?**
+**Вопрос 2. «Пользователь потерял пароль BitLocker, что делать?»**
 
-**Ответ.** Уточняю, что именно на экране — это экран BitLocker Recovery. Не даю вводить ничего наугад. Нахожу компьютер в AD/учётной системе, достаю recovery password (эскалированный ключ), проверяю личность пользователя по процедуре, диктую код лично/через защищённый канал. После входа выясняю причину: обновление BIOS/прошивки, изменение Secure Boot, замена железа, отключение TPM. Фиксирую в заявке, при повторяемости — эскалирую. Если ключа в AD нет — честно говорю, что восстановление невозможно без него, и не обещаю чудес.
+Ответ: уточнить, что именно просит система — пароль или ключ восстановления. Если пароль — найти ключ восстановления (в AD, в консоли управления или в защищённом хранилище), ввести его на экране BitLocker, загрузиться, затем при необходимости сменить пароль. Если ключа нет нигде — данные не восстановить, это эскалация в ИБ и к владельцу данных.
 
-**Что хочет услышать интервьюер:** знание экрана recovery, наличие процесса проверки личности, отсутствие паники и «сейчас что-нибудь попробуем».
+*Что хочет услышать интервьюер:* что вы не пытаетесь «взломать», а ищете легальный путь; знаете, где в компании хранятся ключи.
 
-**Красный флаг:** «Скажу пользователю код из консоли, он же владелец ноутбука» без проверки личности; попытки «сбросить» BitLocker.
+*Красный флаг:* «переустановлю Windows» без попытки найти ключ.
 
-**3. Что такое цепочка доверия и почему браузер показывает ошибку сертификата?**
+**Вопрос 3. «Чем LUKS отличается от BitLocker?»**
 
-**Ответ.** Браузер строит цепочку от сертификата сайта к промежуточному CA и дальше к корневому, который заранее лежит в хранилище доверия ОС/браузера. Для каждого звена проверяется подпись, срок действия, назначение ключа, соответствие имени (SAN) и неотозванность (CRL/OCSP). Ошибка означает разрыв хоть в одном звене: самоподписанный сертификат, неизвестный корень (например, внутренний УЦ, чей корень не установлен на машине), истёкший срок, неверное системное время или несовпадение имени. Лечится не «нажатием Продолжить», а установкой правильного корневого сертификата или заменой сертификата на сервере.
+Ответ: LUKS — стандарт шифрования разделов в Linux, работает через `cryptsetup` и `dm-crypt`. Ключи хранятся в заголовке LUKS, есть несколько слотов. BitLocker — решение Microsoft для Windows, интегрировано с TPM и AD. Принцип похож: шифрование тома + ключ, защищённый паролем/TPM. Разница в экосистеме и инструментах.
 
-**Что хочет услышать интервьюер:** понимание, что доверие — это локальный список, а не свойство сертификата; знание типовых причин.
+*Что хочет услышать интервьюер:* что вы не путаете уровни (шифрование диска vs шифрование файла) и знаете оба инструмента хотя бы на уровне «что это и зачем».
 
-**Красный флаг:** «Надо просто нажать "Всё равно перейти"» как основной метод решения.
+*Красный флаг:* «LUKS — это программа для Windows».
 
-**4. В чём разница между BitLocker и LUKS? Что общего?**
+**Вопрос 4. «Что такое сертификат сайта и как браузер его проверяет?»**
 
-**Ответ.** Общее: оба шифруют блочное устройство целиком симметричным шифром (AES-XTS), оба используют двухуровневую схему «ключ пользователя → master key → данные», оба требуют отдельного хранения ключа восстановления. Различия: BitLocker — продукт Windows с TPM, эскалацией ключей в AD и GUI; LUKS — формат заголовка в Linux поверх `dm-crypt`, управляется `cryptsetup`, поддерживает несколько паролей (keyslots) и требует ручного бэкапа заголовка. В LUKS потеря заголовка = потеря данных, даже при знании пароля; в BitLocker аналогичную роль играют метаданные тома, но там есть встроенные механизмы восстановления.
+Ответ: сертификат — цифровой «паспорт» сайта: имя, открытый ключ, срок действия, издатель (УЦ). Браузер строит цепочку от сертификата сайта до доверенного корневого УЦ, проверяет подпись, срок и совпадение имени. Если что-то не сходится — предупреждение.
 
-**Что хочет услышать интервьюер:** что вы понимаете общий принцип, а не заучили две команды.
+*Что хочет услышать интервьюер:* понимание цепочки доверия и того, что «сертификат недействителен» — это чаще всего истёкший срок или неверные часы, а не взлом.
 
-**Красный флаг:** «LUKS — это пароль на Linux», «в LUKS нет восстановления, поэтому он лучше».
+*Красный флаг:* «сертификат — это пароль от сайта».
 
-**5. Зачем вообще нужно асимметричное шифрование, если диски шифруют симметричным?**
+**Вопрос 5. «Что такое PKI и зачем она компании?»**
 
-**Ответ.** Асимметрика решает две задачи, которые симметрика решить не может: обмен ключом с незнакомцем по открытому каналу (в TLS клиент шифрует ключ сессии публичным ключом сервера) и подпись — доказательство авторства и целостности (ЭЦП, подпись сертификата CA). Симметрика в тысячи раз быстрее, поэтому ею шифруют объёмные данные. Отсюда гибридная схема: асимметрикой договариваемся и подписываем, симметрикой шифруем полезную нагрузку.
+Ответ: PKI — инфраструктура открытых ключей: корневой УЦ, промежуточные УЦ, выдача и отзыв сертификатов. Нужна для HTTPS внутри компании, аутентификации пользователей и устройств, подписи документов (в РФ — часто на ГОСТ, через КриптоПро). L1 обычно сталкивается с ней через ошибки сертификатов в браузере и почте.
 
-**Что хочет услышать интервьюер:** понимание «зачем два вида» и связи с сертификатами и ЭЦП, а в РФ — с ГОСТ Р 34.10-2012.
+*Что хочет услышать интервьюер:* что вы понимаете место PKI в общей картине и не путаете её с «просто сертификатом сайта».
 
-**Красный флаг:** «Асимметричное надёжнее, поэтому надо всё шифровать им».
+*Красный флаг:* «PKI — это что-то про Linux».
 
 ## 8. Источники (официальная документация)
 
-- **learn.microsoft.com** — раздел «BitLocker» (BitLocker overview, BitLocker recovery guide); статьи «manage-bde» и «BitLocker cmdlets» (модуль PowerShell); «certutil» и «Certificates and Public Key Infrastructure». Поиск: `BitLocker recovery password protectors site:learn.microsoft.com`, `manage-bde command-line reference`, `New-SelfSignedCertificate PowerShell`.
-- **learn.microsoft.com** — «Active Directory BitLocker key escrow» (хранение ключей восстановления в AD). Поиск: `BitLocker recovery information Active Directory msFVE-RecoveryPassword`. `[ПРОВЕРИТЬ]` точное название статьи.
-- **gitlab.com/cryptsetup/cryptsetup** — репозиторий и документация `cryptsetup`; **man7.org** — man-страницы `cryptsetup(8)`, `crypttab(5)`, `dm-crypt`. Поиск: `cryptsetup luksFormat man page`, `cryptsetup luksHeaderBackup`.
-- **ubuntu.com** — Server documentation, раздел про шифрование диска (LUKS) и раздел «Certificates». Поиск: `Ubuntu server LUKS full disk encryption documentation`, `Ubuntu update-ca-certificates`.
-- **openssl.org** — документация `openssl-x509`, `openssl-req`, `openssl-verify`, `openssl-s_client`. Поиск: `openssl x509 man page`, `openssl req -x509 self-signed certificate`.
-- **datatracker.ietf.org** — RFC 5280 «Internet X.509 Public Key Infrastructure Certificate and CRL Profile» (первоисточник по полям сертификата). Поиск: `RFC 5280 X.509 certificate profile`.
-- **cryptopro.ru** — документация КриптоПро CSP, «КриптоПро ЭЦП Browser plug-in», инструкции по установке корневых сертификатов УЦ. Поиск: `КриптоПро CSP документация`, `КриптоПро ЭЦП Browser plug-in установка`. `[ПРОВЕРИТЬ]` актуальные названия продуктов и версий.
-- **Удостоверяющий центр Минцифры** — инструкции по установке корневого сертификата для Госуслуг и ЭДО. Точный домен уточняйте самостоятельно `[ПРОВЕРИТЬ]`; поиск: `установка корневого сертификата УЦ Минцифры инструкция`.
-- **docs.astralinux.ru** — документация Astra Linux, раздел про шифрование диска и режим защищённости (пригодится, если будете делать то же на ASTRA01). Поиск: `Astra Linux шифрование диска LUKS документация`. `[ПРОВЕРИТЬ]` — реализация шифрования в конкретной редакции.
+- **Microsoft Learn** (learn.microsoft.com). Раздел «BitLocker» → «BitLocker overview». Поиск: `BitLocker overview site:learn.microsoft.com`.
+- **Microsoft Learn**. Статья «BitLocker recovery guide». Поиск: `BitLocker recovery guide site:learn.microsoft.com`.
+- **Microsoft Learn**. Командлеты `Get-BitLockerVolume`, `Enable-BitLocker`, `Add-BitLockerKeyProtector`. Поиск: `Enable-BitLocker site:learn.microsoft.com`.
+- **cryptsetup project** (gitlab.com/cryptsetup/cryptsetup). Раздел «LUKS2 format specification» и man-страницы `cryptsetup(8)`, `cryptsetup-luksFormat(8)`. Поиск: `cryptsetup luksFormat man page`.
+- **Ubuntu Documentation** (ubuntu.com/server/docs). Раздел «Disk encryption». Поиск: `Ubuntu disk encryption LUKS site:ubuntu.com`.
+- **OpenSSL** (openssl.org). Раздел «Documents» → `openssl-s_client`, `openssl-x509`. Поиск: `openssl s_client x509 man page`.
+- **RFC 5280** (datatracker.ietf.org). «Internet X.509 Public Key Infrastructure Certificate and CRL Profile». Поиск: `RFC 5280 X.509`.
+- **КриптоПро** (cryptopro.ru). Раздел «Документация» → «КриптоПро CSP». Поиск: `КриптоПро CSP документация`. `[ПРОВЕРИТЬ]` актуальность раздела на 2026 год.
